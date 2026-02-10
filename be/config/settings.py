@@ -40,6 +40,9 @@ class Settings:
     # 로깅
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     
+    # 서버 포트 (중앙 관리)
+    SERVER_PORT = int(os.getenv("SERVER_PORT", "5000"))
+    
     @classmethod
     def validate(cls):
         """설정 검증"""

@@ -3,7 +3,7 @@ services:
     image: introlab3it/rtabmap_ros:noetic-latest
     container_name: rtabmap
     environment:
-      - LD_LIBRARY_PATH=/opt/ros/noetic/lib/aarch64-linux-gnu:/opt/ros/noetic/lib
+      - LD_LIBRARY_PATH=/opt/ros/noetic/lib/x86_64-linux-gnu:/opt/ros/noetic/lib
     volumes:
       - ./be/data:/data
     working_dir: /data
@@ -18,8 +18,11 @@ services:
       dockerfile: Dockerfile
     container_name: indoor-pathfinding-web
     ports:
-      - "5000:5000"
+      - "${SERVER_PORT:-5000}:${SERVER_PORT:-5000}"
     environment:
+      # Server Configuration
+      - SERVER_PORT=${SERVER_PORT:-5000}
+      
       # SLAM Engine Configuration
       - SLAM_ENGINE=rtabmap
       - RTABMAP_PATH=docker://rtabmap
@@ -42,7 +45,7 @@ services:
     restart: unless-stopped
     networks:
       - indoor-network
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+    command: uvicorn main:app --host 0.0.0.0 --port ${SERVER_PORT:-5000} --workers 1
 
 networks:
   indoor-network:

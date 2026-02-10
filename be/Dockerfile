@@ -25,8 +25,8 @@ COPY . .
 # Create data directory
 RUN mkdir -p /app/data
 
-# Expose port
-EXPOSE 8000
+# Expose port (configurable via environment variable)
+EXPOSE ${SERVER_PORT:-5000}
 
 # Run uvicorn (command specified in docker-compose.yml)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "${SERVER_PORT:-5000}", "--workers", "1"]
