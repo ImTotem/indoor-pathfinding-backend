@@ -1,0 +1,487 @@
+import 'package:flutter/material.dart';
+import 'dart:async';
+import 'dart:typed_data';
+
+import '../services/api_service.dart';
+import '../services/streaming_uploader.dart';
+import '../services/sensor_service.dart';
+import '../services/arcore_shared_camera_service.dart';
+import '../services/isolate_image_processor.dart';
+import '../models/frame_data.dart';
+import '../models/camera_intrinsics.dart';
+import '../config/app_config.dart';
+import '../config/constants.dart';
+import '../widgets/status_bar.dart';
+import '../widgets/crosshair_painter.dart';
+import '../widgets/action_button.dart';
+import 'processing_screen.dart';
+
+class ScanningScreen extends StatefulWidget {
+  @override
+  _ScanningScreenState createState() => _ScanningScreenState();
+}
+
+class _ScanningScreenState extends State<ScanningScreen> {
+  final ARCoreSharedCameraService _sharedCamera = ARCoreSharedCameraService();
+  final SensorService _sensorService = SensorService();
+  final IsolateImageProcessor _imageProcessor = IsolateImageProcessor();
+
+  StreamingUploader? _uploader;
+  Timer? _captureTimer;
+
+  String _sessionId = '';
+  bool _isScanning = false;
+  bool _isPaused = false;
+  bool _isConnected = true;
+  bool _isCapturing = false;
+  bool _cameraInitialized = false;
+
+  int _frameCount = 0;
+  final _uploadQueueSize = ValueNotifier<int>(0);
+  Future<void>? _imageProcessorInit;
+  CameraIntrinsics? _cameraIntrinsics;
+
+  double _currentFps = 0.0;
+  DateTime _lastFrameTime = DateTime.now();
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeServices();
+    _initializeCamera();
+    _imageProcessorInit = _imageProcessor.initialize();
+
+    // Listen for processed frames
+    _processedFramesSubscription =
+        _imageProcessor.processedFrames.listen((jpegBytes) {
+      if (!mounted) {
+        return;
+      }
+      _processFrameInBackground(jpegBytes);
+    });
+  }
+
+  Future<void> _initializeServices() async {
+    _sensorService.startListening(
+        isRecording: true); // Enable buffer accumulation
+    setState(() {});
+  }
+
+  Future<void> _ensureImageProcessorInitialized() async {
+    _imageProcessorInit ??= _imageProcessor.initialize();
+    await _imageProcessorInit;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        children: [
+          // RepaintBoundary로 AR 뷰 감싸기 (캡처용)
+          RepaintBoundary(
+            key: _repaintKey,
+            child: _cameraService.controller != null &&
+                    _cameraService.isInitialized
+                ? SizedBox.expand(
+                    child: FittedBox(
+                      fit: BoxFit.cover,
+                      child: SizedBox(
+                        width: _cameraService
+                            .controller!.value.previewSize!.height,
+                        height:
+                            _cameraService.controller!.value.previewSize!.width,
+                        child: CameraPreview(_cameraService.controller!),
+                      ),
+                    ),
+                  )
+                : Container(
+                    color: Colors.black,
+                    child: Center(child: CircularProgressIndicator())),
+          ),
+
+          StatusBar(
+            isScanning: _isScanning,
+            isConnected: _isConnected,
+            hasCalibration: _cameraService.cameraIntrinsics != null,
+            cameraIntrinsics: _cameraService.cameraIntrinsics,
+            currentFps: _currentFps,
+            frameCount: _frameCount,
+            uploadedFrames:
+                _uploader?.totalFramesSent, // Pass ValueNotifier directly
+            uploadQueueSize: _uploadQueueSize,
+            hasAccel: _sensorService.hasAccel,
+            hasGyro: _sensorService.hasGyro,
+            hasMagnet: _sensorService.hasMagnet,
+          ),
+
+          if (_isScanning && !_isPaused) _buildCrosshair(),
+
+          _buildBottomControls(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCrosshair() {
+    return Center(
+      child: Container(
+        width: AppConstants.crosshairSize,
+        height: AppConstants.crosshairSize,
+        child: CustomPaint(painter: CrosshairPainter()),
+      ),
+    );
+  }
+
+  Widget _buildBottomControls() {
+    return Positioned(
+      bottom: 0,
+      left: 0,
+      right: 0,
+      child: SafeArea(
+        bottom: true,
+        child: Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [
+                Colors.transparent,
+                Colors.black.withOpacity(0.7),
+              ],
+            ),
+          ),
+          child: Padding(
+            padding: EdgeInsets.symmetric(horizontal: 20, vertical: 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    _getStatusMessage(),
+                    style: TextStyle(color: Colors.white, fontSize: 14),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+                SizedBox(height: 20),
+                _buildActionButtons(),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _getStatusMessage() {
+    if (_isPaused) return AppConstants.msgPaused;
+    if (_isScanning) return AppConstants.msgScanning;
+    return AppConstants.msgReady;
+  }
+
+  Widget _buildActionButtons() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        if (!_isScanning)
+          ActionButton(
+            icon: Icons.play_arrow,
+            label: '스캔 시작',
+            color: Color(AppConstants.colorGreen),
+            onPressed: _startScanning,
+          ),
+        if (_isScanning) ...[
+          ActionButton(
+            icon: _isPaused ? Icons.play_arrow : Icons.pause,
+            label: _isPaused ? '재개' : '일시정지',
+            color: Color(AppConstants.colorOrange),
+            onPressed: _togglePause,
+          ),
+          SizedBox(width: 16),
+          ActionButton(
+            icon: Icons.stop,
+            label: '완료',
+            color: Color(AppConstants.colorRed),
+            onPressed: _stopScanning,
+          ),
+        ],
+      ],
+    );
+  }
+
+  Future<void> _initializeCamera() async {
+    try {
+      await _cameraService.initialize();
+      setState(() {});
+    } catch (e) {
+      print('[Scanning] 카메라 초기화 실패: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('카메라 초기화 실패: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> _startScanning() async {
+    print('[Scanning] ========== 스캔 시작 버튼 클릭됨 ==========');
+    try {
+      await _ensureImageProcessorInitialized();
+
+      // Initialize ARCore depth
+      print('[Scanning] ARCore depth 초기화 시작...');
+      _depthInitialized = await _depthService.initDepth();
+      if (_depthInitialized) {
+        print('[Scanning] ARCore depth 초기화 성공');
+      } else {
+        print('[Scanning] ARCore depth 초기화 실패 - 뎁스 없이 계속');
+      }
+
+      print('[Scanning] API 호출 시작...');
+      _sessionId = await ApiService.startScan();
+      print('[Scanning] 세션 시작: $_sessionId');
+
+      _uploader = StreamingUploader(sessionId: _sessionId);
+
+      setState(() {
+        _isScanning = true;
+        _isPaused = false;
+        _frameCount = 0;
+      });
+
+      _sensorService.clearBuffer();
+
+      // Start camera image stream
+      await _cameraService.startCapture();
+
+      print('[Scanning] 타이머 시작 (${1000 / AppConfig.frameIntervalMs} FPS)');
+
+      // 설정된 FPS로 캡처
+      _captureTimer = Timer.periodic(
+        Duration(milliseconds: AppConfig.frameIntervalMs),
+        (timer) {
+          if (!_isPaused) {
+            _captureFrame();
+          }
+        },
+      );
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              Icon(Icons.check_circle, color: Colors.white),
+              SizedBox(width: 8),
+              Text('스캔 시작 - 천천히 움직이며 주변을 촬영하세요'),
+            ],
+          ),
+          backgroundColor: Color(AppConstants.colorGreen),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } catch (e) {
+      print('[Scanning] ========== 시작 실패 ==========');
+      print('[Scanning] 에러: $e');
+      print('[Scanning] 스택 트레이스: ${StackTrace.current}');
+      setState(() {
+        _isConnected = false;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('${AppConstants.errStartFailed}: $e'),
+          backgroundColor: Color(AppConstants.colorRed),
+          duration: Duration(seconds: 5),
+        ),
+      );
+    }
+  }
+
+  void _togglePause() {
+    setState(() {
+      _isPaused = !_isPaused;
+    });
+  }
+
+  Future<void> _captureFrame() async {
+    if (!_isScanning || _isPaused || _isCapturing) {
+      return;
+    }
+
+    _isCapturing = true;
+
+    final now = DateTime.now();
+    final delta = now.difference(_lastFrameTime).inMilliseconds;
+    if (delta > 0) {
+      setState(() {
+        _frameCount++;
+        _currentFps = 1000.0 / delta;
+      });
+    }
+    _lastFrameTime = now;
+
+    try {
+      // Get latest CameraImage from stream
+      final cameraImage = _cameraService.getLatestFrame();
+      if (cameraImage == null) {
+        _isCapturing = false;
+        return;
+      }
+
+      // ========== 변경: Isolate로 처리 ==========
+      // 기존: await ImageConverter.convertCameraImageToJpeg()
+      // 신규: Send to isolate (non-blocking)
+      _imageProcessor.processFrame(cameraImage, AppConfig.imageQuality);
+    } catch (e) {
+      print('[Scanning] Frame capture error: $e');
+    } finally {
+      _isCapturing = false;
+    }
+  }
+
+  Future<void> _processFrameInBackground(Uint8List jpegBytes) async {
+    // JPEG bytes already from ImageConverter (no need for ImageProcessor)
+    // Binary upload - no base64 encoding needed
+
+    final imuData = _sensorService.getIMUData();
+    // Don't clear buffer - let num_samples accumulate across frames
+
+    // Capture depth if available
+    Uint8List? depthBytes;
+    int? depthWidth;
+    int? depthHeight;
+
+    if (_depthInitialized) {
+      try {
+        final depthData = await _depthService.captureDepth();
+        if (depthData != null) {
+          depthBytes = depthData['data'] as Uint8List;
+          depthWidth = depthData['width'] as int;
+          depthHeight = depthData['height'] as int;
+          print(
+              '[Scanning] Depth captured: ${depthWidth}x${depthHeight}, ${depthBytes.length} bytes');
+        }
+      } catch (e) {
+        print('[Scanning] Depth capture failed: $e');
+      }
+    }
+
+    final frameData = FrameData(
+      imageBytes: jpegBytes,
+      depthBytes: depthBytes,
+      depthWidth: depthWidth,
+      depthHeight: depthHeight,
+      position: [0.0, 0.0, 0.0], // Identity position
+      orientation: [0.0, 0.0, 0.0, 1.0], // Identity quaternion
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      imuData: imuData,
+      cameraIntrinsics: _cameraService.cameraIntrinsics,
+    );
+
+    _uploadFrameAsync(frameData);
+  }
+
+  void _uploadFrameAsync(FrameData frameData) {
+    // Fire-and-forget: await 제거
+    _uploadQueueSize.value++;
+
+    _uploader?.addFrame(frameData).then((_) {
+      _uploadQueueSize.value--;
+      _isConnected = true;
+    }).catchError((e) {
+      print('[Scanning] 업로드 실패: $e');
+      _uploadQueueSize.value--;
+      _isConnected = false;
+    });
+  }
+
+  Future<void> _stopScanning() async {
+    _captureTimer?.cancel();
+
+    // Dispose ARCore depth
+    if (_depthInitialized) {
+      await _depthService.disposeDepth();
+      _depthInitialized = false;
+    }
+
+    // Stop camera image stream
+    await _cameraService.stopCapture();
+
+    setState(() {
+      _isScanning = false;
+      _isPaused = false;
+    });
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => Center(
+        child: Container(
+          padding: EdgeInsets.all(24),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text(AppConstants.msgUploading, style: TextStyle(fontSize: 16)),
+              SizedBox(height: 8),
+              ValueListenableBuilder<int>(
+                valueListenable: _uploadQueueSize,
+                builder: (context, queueSize, child) {
+                  return Text('$queueSize개 대기 중',
+                      style: TextStyle(fontSize: 12, color: Colors.grey));
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    try {
+      while (_uploadQueueSize.value > 0) {
+        await Future.delayed(Duration(milliseconds: 100));
+      }
+
+      await _uploader?.finish();
+
+      Navigator.pop(context);
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) => ProcessingScreen(sessionId: _sessionId),
+        ),
+      );
+    } catch (e) {
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('${AppConstants.errFinishFailed}: $e'),
+          backgroundColor: Color(AppConstants.colorRed),
+        ),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _processedFramesSubscription?.cancel();
+    _imageProcessor.dispose();
+    _uploader?.dispose();
+    _uploadQueueSize.dispose();
+    _captureTimer?.cancel();
+    _cameraService.dispose();
+    _sensorService.dispose();
+    super.dispose();
+  }
+}
