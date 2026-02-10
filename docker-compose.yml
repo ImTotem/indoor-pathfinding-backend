@@ -1,0 +1,50 @@
+services:
+  rtabmap:
+    image: introlab3it/rtabmap_ros:noetic-latest
+    container_name: rtabmap
+    environment:
+      - LD_LIBRARY_PATH=/opt/ros/noetic/lib/aarch64-linux-gnu:/opt/ros/noetic/lib
+    volumes:
+      - ./be/data:/data
+    working_dir: /data
+    command: tail -f /dev/null
+    restart: unless-stopped
+    networks:
+      - indoor-network
+
+  web:
+    build:
+      context: ./be
+      dockerfile: Dockerfile
+    container_name: indoor-pathfinding-web
+    ports:
+      - "5000:5000"
+    environment:
+      # SLAM Engine Configuration
+      - SLAM_ENGINE=rtabmap
+      - RTABMAP_PATH=docker://rtabmap
+      - LOG_LEVEL=INFO
+      
+      # PostgreSQL Configuration
+      - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DB=${POSTGRES_DB:-slam_db}
+      - POSTGRES_USER=${POSTGRES_USER:-slam_service}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
+      
+      # Fixed Map Mode (optional)
+      - USE_FIXED_MAP=${USE_FIXED_MAP:-false}
+      - FIXED_MAP_ID=${FIXED_MAP_ID:-}
+    volumes:
+      - ./be/data:/app/data
+    depends_on:
+      - rtabmap
+    restart: unless-stopped
+    networks:
+      - indoor-network
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+
+networks:
+  indoor-network:
+    external: true
+    name: indoor-pathfinding-backend_indoor-network
