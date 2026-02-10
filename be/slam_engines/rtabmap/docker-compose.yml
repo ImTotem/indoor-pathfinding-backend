@@ -1,0 +1,11 @@
+services:
+  rtabmap:
+    image: introlab3it/rtabmap_ros:noetic-latest
+    container_name: rtabmap
+    environment:
+      - LD_LIBRARY_PATH=/opt/ros/noetic/lib/aarch64-linux-gnu:/opt/ros/noetic/lib
+    volumes:
+      - ../../data:/data
+    working_dir: /data
+    command: tail -f /dev/null
+    restart: unless-stopped

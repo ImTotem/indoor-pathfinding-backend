@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker exec:*)",
+      "Bash(xargs cat:*)",
+      "Bash(flutter analyze:*)",
+      "Bash(docker compose:*)",
+      "Bash(__NEW_LINE_eb7911d99f85eea6__ sleep 2)",
+      "Bash(docker port:*)"
+    ]
+  }
+}

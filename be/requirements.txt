@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+aiofiles
+pydantic
+python-multipart
+pillow
+jinja2
+python-dotenv
+numpy
+opencv-python
+asyncpg==0.29.0
