@@ -1,6 +1,14 @@
 """
-PostgreSQL adapter for SLAM database storage.
-Provides async CRUD operations for slam_jobs and slam_databases tables.
+PostgreSQL adapter for SLAM service.
+Uses existing scan_sessions table from indoor-pathfinding-backend (Spring Boot JPA).
+
+Table: scan_sessions
+Columns: id (UUID PK), building_id (UUID FK), file_name, file_path, file_size,
+         status (ENUM: UPLOADED/EXTRACTING/PROCESSING/COMPLETED/FAILED),
+         error_message, preview_image_path, processed_preview_path,
+         total_nodes, total_distance, created_at, updated_at
+
+IMPORTANT: No schema modifications allowed. Read/write to existing tables only.
 """
 
 import asyncio
@@ -12,39 +20,27 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
+# Status values matching ScanStatus enum in Spring Boot
+SCAN_STATUS_UPLOADED = "UPLOADED"
+SCAN_STATUS_EXTRACTING = "EXTRACTING"
+SCAN_STATUS_PROCESSING = "PROCESSING"
+SCAN_STATUS_COMPLETED = "COMPLETED"
+SCAN_STATUS_FAILED = "FAILED"
+
 
 class PostgresAdapter:
     """
-    Async database adapter for SLAM storage operations.
+    Async database adapter using existing scan_sessions table.
     
     Uses asyncpg connection pool (injected via constructor).
-    Implements retry logic for connection failures with exponential backoff.
+    All queries target the scan_sessions table owned by Spring Boot backend.
     """
     
     def __init__(self, pool: asyncpg.Pool):
-        """
-        Initialize adapter with asyncpg connection pool.
-        
-        Args:
-            pool: asyncpg.Pool instance (managed by FastAPI lifespan)
-        """
         self.pool = pool
     
-    async def _retry_on_connection_error(self, func, *args, max_retries: int = 3, **kwargs):
-        """
-        Retry function on connection errors with exponential backoff.
-        
-        Args:
-            func: Async function to retry
-            max_retries: Maximum retry attempts (default: 3)
-            *args, **kwargs: Arguments passed to func
-        
-        Returns:
-            Result of func
-        
-        Raises:
-            PostgresError or ConnectionRefusedError after max retries
-        """
+    async def _retry(self, func, *args, max_retries: int = 3, **kwargs):
+        """Retry on connection errors with exponential backoff."""
         for attempt in range(max_retries):
             try:
                 return await func(*args, **kwargs)
@@ -52,226 +48,144 @@ class PostgresAdapter:
                 if attempt == max_retries - 1:
                     logger.error(f"Max retries reached. Last error: {e}")
                     raise
-                delay = 0.1 * (2 ** attempt)  # 0.1s, 0.2s, 0.4s
+                delay = 0.1 * (2 ** attempt)
                 logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay}s...")
                 await asyncio.sleep(delay)
     
-    async def create_job(self, session_id: str) -> str:
+    async def get_session(self, session_id: str) -> dict:
         """
-        Create a new SLAM job with 'pending' status.
+        Fetch scan_session by id.
         
         Args:
-            session_id: Session identifier
+            session_id: scan_sessions.id (UUID string)
         
         Returns:
-            map_id: Generated UUID (hex format, no dashes)
-        
-        Raises:
-            PostgresError: Database operation failed
+            dict with session info, or empty dict if not found
         """
-        map_id = uuid.uuid4().hex  # Generate UUID without dashes
-        
-        async def _insert_job():
+        async def _fetch():
             async with self.pool.acquire() as conn:
-                await conn.execute(
+                row = await conn.fetchrow(
                     """
-                    INSERT INTO slam_jobs (session_id, map_id, status)
-                    VALUES ($1, $2, $3)
+                    SELECT id, building_id, file_name, file_path, file_size,
+                           status, error_message, total_nodes, total_distance,
+                           created_at, updated_at
+                    FROM scan_sessions
+                    WHERE id = $1
                     """,
-                    session_id,
-                    map_id,
-                    'pending'
+                    uuid.UUID(session_id)
                 )
+                if row:
+                    result = dict(row)
+                    result["id"] = str(result["id"])
+                    result["building_id"] = str(result["building_id"])
+                    return result
+                return {}
         
-        await self._retry_on_connection_error(_insert_job)
-        logger.info(f"Created job: session_id={session_id}, map_id={map_id}")
-        return map_id
+        return await self._retry(_fetch)
     
-    async def update_job_status(
-        self, 
-        map_id: str, 
-        status: str, 
+    async def update_status(
+        self,
+        session_id: str,
+        status: str,
         error_message: Optional[str] = None
     ):
         """
-        Update job status and error message.
+        Update scan_sessions.status and optionally error_message.
         
         Args:
-            map_id: Map identifier
-            status: New status ('pending', 'in_progress', 'success', 'failed')
-            error_message: Error details (only for 'failed' status)
-        
-        Raises:
-            PostgresError: Database operation failed
+            session_id: scan_sessions.id (UUID string)
+            status: One of UPLOADED, EXTRACTING, PROCESSING, COMPLETED, FAILED
+            error_message: Error details (for FAILED status)
         """
-        async def _update_status():
+        async def _update():
             async with self.pool.acquire() as conn:
                 await conn.execute(
                     """
-                    UPDATE slam_jobs
+                    UPDATE scan_sessions
                     SET status = $1, error_message = $2, updated_at = CURRENT_TIMESTAMP
-                    WHERE map_id = $3
+                    WHERE id = $3
                     """,
                     status,
                     error_message,
-                    map_id
+                    uuid.UUID(session_id)
                 )
         
-        await self._retry_on_connection_error(_update_status)
-        logger.info(f"Updated job status: map_id={map_id}, status={status}")
+        await self._retry(_update)
+        logger.info(f"Updated session status: session_id={session_id}, status={status}")
     
-    async def get_job_status(self, map_id: str) -> dict:
+    async def update_processing_result(
+        self,
+        session_id: str,
+        total_nodes: int,
+        total_distance: float,
+        preview_image_path: Optional[str] = None,
+        processed_preview_path: Optional[str] = None,
+    ):
         """
-        Fetch job information by map_id.
+        Update scan_sessions with SLAM processing results and set status to COMPLETED.
+        Mirrors ScanSession.updateProcessingResult() in Spring Boot.
         
         Args:
-            map_id: Map identifier
-        
-        Returns:
-            dict with keys: map_id, session_id, status, created_at, updated_at, error_message
-            Returns empty dict if job not found
-        
-        Raises:
-            PostgresError: Database operation failed
+            session_id: scan_sessions.id (UUID string)
+            total_nodes: Number of nodes extracted
+            total_distance: Total path distance
+            preview_image_path: Path to preview image (optional)
+            processed_preview_path: Path to processed preview (optional)
         """
-        async def _fetch_job():
-            async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT map_id, session_id, status, created_at, updated_at, error_message
-                    FROM slam_jobs
-                    WHERE map_id = $1
-                    """,
-                    map_id
-                )
-                if row:
-                    return dict(row)
-                return {}
-        
-        result = await self._retry_on_connection_error(_fetch_job)
-        logger.debug(f"Fetched job status: map_id={map_id}")
-        return result
-    
-    async def store_input_db(self, map_id: str, db_bytes: bytes):
-        """
-        Store input.db binary data.
-        
-        Args:
-            map_id: Map identifier
-            db_bytes: Binary database file content
-        
-        Raises:
-            PostgresError: Database operation failed
-        """
-        size_bytes = len(db_bytes)
-        
-        async def _insert_db():
+        async def _update():
             async with self.pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO slam_databases (map_id, db_type, db_data, size_bytes)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (map_id, db_type) 
-                    DO UPDATE SET db_data = EXCLUDED.db_data, size_bytes = EXCLUDED.size_bytes
+                    UPDATE scan_sessions
+                    SET status = $1,
+                        total_nodes = $2,
+                        total_distance = $3,
+                        preview_image_path = $4,
+                        processed_preview_path = $5,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $6
                     """,
-                    map_id,
-                    'input',
-                    db_bytes,
-                    size_bytes
+                    SCAN_STATUS_COMPLETED,
+                    total_nodes,
+                    total_distance,
+                    preview_image_path,
+                    processed_preview_path,
+                    uuid.UUID(session_id)
                 )
         
-        await self._retry_on_connection_error(_insert_db)
-        logger.info(f"Stored input.db: map_id={map_id}, size={size_bytes} bytes")
+        await self._retry(_update)
+        logger.info(f"Recorded processing result: session_id={session_id}, nodes={total_nodes}")
     
-    async def store_output_db(self, map_id: str, db_bytes: bytes):
+    async def get_file_path(self, session_id: str) -> Optional[str]:
         """
-        Store output.db binary data.
+        Get the uploaded .db file_path for a session.
         
         Args:
-            map_id: Map identifier
-            db_bytes: Binary database file content
-        
-        Raises:
-            PostgresError: Database operation failed
-        """
-        size_bytes = len(db_bytes)
-        
-        async def _insert_db():
-            async with self.pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO slam_databases (map_id, db_type, db_data, size_bytes)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (map_id, db_type) 
-                    DO UPDATE SET db_data = EXCLUDED.db_data, size_bytes = EXCLUDED.size_bytes
-                    """,
-                    map_id,
-                    'output',
-                    db_bytes,
-                    size_bytes
-                )
-        
-        await self._retry_on_connection_error(_insert_db)
-        logger.info(f"Stored output.db: map_id={map_id}, size={size_bytes} bytes")
-    
-    async def fetch_input_db(self, map_id: str) -> bytes:
-        """
-        Retrieve input.db binary data.
-        
-        Args:
-            map_id: Map identifier
+            session_id: scan_sessions.id (UUID string)
         
         Returns:
-            Binary database file content (empty bytes if not found)
-        
-        Raises:
-            PostgresError: Database operation failed
+            file_path string, or None if not found
         """
-        async def _fetch_db():
+        async def _fetch():
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
-                    SELECT db_data FROM slam_databases
-                    WHERE map_id = $1 AND db_type = $2
-                    """,
-                    map_id,
-                    'input'
+                    "SELECT file_path FROM scan_sessions WHERE id = $1",
+                    uuid.UUID(session_id)
                 )
-                if row:
-                    return bytes(row['db_data'])
-                return b''
+                return row["file_path"] if row else None
         
-        result = await self._retry_on_connection_error(_fetch_db)
-        logger.debug(f"Fetched input.db: map_id={map_id}, size={len(result)} bytes")
-        return result
+        return await self._retry(_fetch)
     
-    async def fetch_output_db(self, map_id: str) -> bytes:
+    async def health_check(self) -> str:
         """
-        Retrieve output.db binary data.
-        
-        Args:
-            map_id: Map identifier
+        Check PostgreSQL connectivity.
         
         Returns:
-            Binary database file content (empty bytes if not found)
-        
-        Raises:
-            PostgresError: Database operation failed
+            "connected" or error string
         """
-        async def _fetch_db():
+        try:
             async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT db_data FROM slam_databases
-                    WHERE map_id = $1 AND db_type = $2
-                    """,
-                    map_id,
-                    'output'
-                )
-                if row:
-                    return bytes(row['db_data'])
-                return b''
-        
-        result = await self._retry_on_connection_error(_fetch_db)
-        logger.debug(f"Fetched output.db: map_id={map_id}, size={len(result)} bytes")
-        return result
+                await conn.fetchval("SELECT 1")
+            return "connected"
+        except Exception as e:
+            return f"error: {str(e)}"
