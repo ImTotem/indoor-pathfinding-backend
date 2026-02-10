@@ -66,7 +66,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logger.info(f"{settings.API_TITLE} | SLAM Engine: {settings.SLAM_ENGINE_TYPE} | Available: {SLAMEngineFactory.list_engines()}")
+logger.info(f"\n{'='*60}")
+logger.info(f"  {settings.API_TITLE}")
+logger.info(f"  SLAM Engine: {settings.SLAM_ENGINE_TYPE}")
+logger.info(f"  Available: {SLAMEngineFactory.list_engines()}")
+logger.info(f"{'='*60}\n")
 
 # 라우터 등록
 app.include_router(scan.router)
