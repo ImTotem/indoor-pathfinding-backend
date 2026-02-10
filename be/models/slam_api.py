@@ -3,13 +3,13 @@ from typing import List
 
 
 class SLAMProcessRequest(BaseModel):
-    session_id: str = Field(..., json_schema_extra={"example": "550e8400-e29b-41d4-a716-446655440000"})
+    building_id: str = Field(..., json_schema_extra={"example": "550e8400-e29b-41d4-a716-446655440000"})
 
-    @field_validator('session_id')
+    @field_validator('building_id')
     @classmethod
-    def validate_session_id(cls, v: str) -> str:
+    def validate_building_id(cls, v: str) -> str:
         if not v or not v.strip():
-            raise ValueError('session_id cannot be empty')
+            raise ValueError('building_id cannot be empty')
         return v.strip()
 
 
@@ -39,7 +39,7 @@ class SLAMLocalizeResponse(BaseModel):
 
 class MapMetadata(BaseModel):
     map_id: str
-    session_id: str
+    building_id: str
     num_keyframes: int
     created_at: str
     status: str
