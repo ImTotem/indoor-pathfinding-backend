@@ -41,7 +41,6 @@ class SLAMJobQueue:
         self.worker_task: Optional[asyncio.Task] = None
         self._shutdown_flag = False
 
-        print("[SLAMJobQueue] initialized")
         logger.info("SLAMJobQueue initialized")
     
     async def enqueue(self, building_id: str, session_db_pairs: List[Tuple[str, str]]):
@@ -55,7 +54,6 @@ class SLAMJobQueue:
         if self.worker_task is not None and not self.worker_task.done():
             raise RuntimeError("Worker already running")
         self.worker_task = asyncio.create_task(self._worker_loop())
-        print("[SLAMJobQueue] worker started")
         logger.info("SLAM job queue worker started")
     
     async def _process_session(self, session_id: str, input_db_path: str) -> dict:
@@ -118,11 +116,10 @@ class SLAMJobQueue:
                     pass
     
     async def _worker_loop(self):
-        print("[SLAMJobQueue] worker loop running, waiting for jobs...")
+        logger.info("Worker loop running, waiting for jobs...")
         while True:
             try:
                 building_id, session_db_pairs = await self.queue.get()
-                print(f"[SLAMJobQueue] job dequeued: building_id={building_id}")
                 logger.info(f"Job dequeued: building_id={building_id}, sessions={len(session_db_pairs)}, remaining={self.queue.qsize()}")
                 
                 try:
