@@ -18,31 +18,13 @@ from utils.temp_file_manager import cleanup_orphaned_temps
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    FastAPI lifespan context manager for startup and shutdown events.
-    
-    Startup:
-    - Initialize asyncpg connection pool
-    - Create PostgresAdapter for database operations
-    - Create SLAMJobQueue for sequential job processing
-    - Inject dependencies into slam_routes module
-    - Start background job queue worker
-    - Clean up orphaned temporary files
-    
-    Shutdown:
-    - Gracefully shutdown job queue worker
-    - Close asyncpg connection pool
-    
-    IMPORTANT: Run with single worker to guarantee singleton queue behavior
-    uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
-    """
-    # Startup
+
     pool = await asyncpg.create_pool(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
+        host=os.getenv("POSTGRES_HOST", "indoor-pathfinding-db"),
         port=int(os.getenv("POSTGRES_PORT", "5432")),
-        database=os.getenv("POSTGRES_DB", "slam_db"),
-        user=os.getenv("POSTGRES_USER", "slam_service"),
-        password=os.getenv("POSTGRES_PASSWORD", ""),
+        database=os.getenv("POSTGRES_DB", "indoor_pathfinding"),
+        user=os.getenv("POSTGRES_USER", "indoor"),
+        password=os.getenv("POSTGRES_PASSWORD", "indoor1234"),
         min_size=1,
         max_size=10
     )
@@ -51,7 +33,7 @@ async def lifespan(app: FastAPI):
     slam_routes.postgres_adapter = postgres_adapter
     
     slam_engine = SLAMEngineFactory.create(settings.SLAM_ENGINE_TYPE)
-    job_queue = SLAMJobQueue(postgres_adapter, slam_engine)
+    job_queue = SLAMJobQueue(postgres_adapter, slam_engine, settings.MAPS_DIR)
     slam_routes.job_queue = job_queue
     
     await job_queue.start_worker()
