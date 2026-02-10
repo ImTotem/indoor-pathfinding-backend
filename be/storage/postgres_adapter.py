@@ -14,7 +14,7 @@ IMPORTANT: No schema modifications allowed. Read/write to existing tables only.
 import asyncio
 import logging
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 import asyncpg
 
@@ -173,6 +173,39 @@ class PostgresAdapter:
                     uuid.UUID(session_id)
                 )
                 return row["file_path"] if row else None
+        
+        return await self._retry(_fetch)
+    
+    async def get_sessions_by_building_id(self, building_id: str) -> List[dict]:
+        """
+        Fetch all scan_sessions belonging to a building.
+        
+        Args:
+            building_id: buildings.id (UUID string)
+        
+        Returns:
+            List of session dicts, or empty list if none found
+        """
+        async def _fetch():
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, building_id, file_name, file_path, file_size,
+                           status, error_message, total_nodes, total_distance,
+                           created_at, updated_at
+                    FROM scan_sessions
+                    WHERE building_id = $1
+                    ORDER BY created_at ASC
+                    """,
+                    uuid.UUID(building_id)
+                )
+                results = []
+                for row in rows:
+                    result = dict(row)
+                    result["id"] = str(result["id"])
+                    result["building_id"] = str(result["building_id"])
+                    results.append(result)
+                return results
         
         return await self._retry(_fetch)
     

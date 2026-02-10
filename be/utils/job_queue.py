@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from storage.postgres_adapter import SCAN_STATUS_PROCESSING, SCAN_STATUS_FAILED
 
@@ -30,12 +30,12 @@ class SLAMJobQueue:
         
         logger.info("SLAMJobQueue initialized")
     
-    async def enqueue(self, session_id: str, input_db_path: str):
+    async def enqueue(self, building_id: str, session_db_pairs: List[Tuple[str, str]]):
         if self._shutdown_flag:
             raise RuntimeError("Queue is shutting down")
         
-        await self.queue.put((session_id, input_db_path))
-        logger.info(f"Job enqueued: session_id={session_id}, queue_length={self.queue.qsize()}")
+        await self.queue.put((building_id, session_db_pairs))
+        logger.info(f"Job enqueued: building_id={building_id}, sessions={len(session_db_pairs)}, queue_length={self.queue.qsize()}")
     
     async def start_worker(self):
         if self.worker_task is not None:
@@ -46,39 +46,47 @@ class SLAMJobQueue:
     async def _worker_loop(self):
         while True:
             try:
-                session_id, input_db_path = await self.queue.get()
-                logger.info(f"Job dequeued: session_id={session_id}, remaining={self.queue.qsize()}")
+                building_id, session_db_pairs = await self.queue.get()
+                logger.info(f"Job dequeued: building_id={building_id}, sessions={len(session_db_pairs)}, remaining={self.queue.qsize()}")
                 
                 try:
-                    await self.adapter.update_status(session_id, SCAN_STATUS_PROCESSING)
+                    for session_id, _ in session_db_pairs:
+                        await self.adapter.update_status(session_id, SCAN_STATUS_PROCESSING)
                     
-                    result = await self.engine.process(
-                        session_id=session_id,
-                        frames_data={"input_db_path": input_db_path},
-                        progress_callback=None
-                    )
+                    last_result = None
+                    for session_id, input_db_path in session_db_pairs:
+                        logger.info(f"Processing session {session_id}: {input_db_path}")
+                        
+                        result = await self.engine.process(
+                            session_id=session_id,
+                            frames_data={"input_db_path": input_db_path},
+                            progress_callback=None
+                        )
+                        last_result = result
+                        
+                        total_nodes = result.get('total_nodes', 0)
+                        total_distance = result.get('total_distance', 0.0)
+                        
+                        await self.adapter.update_processing_result(
+                            session_id=session_id,
+                            total_nodes=total_nodes,
+                            total_distance=total_distance,
+                        )
+                        logger.info(f"Session processed: session_id={session_id}")
                     
-                    # output.db → filesystem (data/maps/{session_id}.db)
-                    if 'binary' in result:
+                    if last_result and 'binary' in last_result:
                         self.maps_dir.mkdir(parents=True, exist_ok=True)
-                        output_path = self.maps_dir / f"{session_id}.db"
-                        output_path.write_bytes(result['binary'])
-                        logger.info(f"Output saved: {output_path} ({len(result['binary'])} bytes)")
+                        output_path = self.maps_dir / f"{building_id}.db"
+                        output_path.write_bytes(last_result['binary'])
+                        logger.info(f"Building map saved: {output_path} ({len(last_result['binary'])} bytes)")
                     
-                    total_nodes = result.get('total_nodes', 0)
-                    total_distance = result.get('total_distance', 0.0)
-                    
-                    await self.adapter.update_processing_result(
-                        session_id=session_id,
-                        total_nodes=total_nodes,
-                        total_distance=total_distance,
-                    )
-                    logger.info(f"Processing succeeded: session_id={session_id}")
+                    logger.info(f"Building processing succeeded: building_id={building_id}")
                     
                 except Exception as e:
                     error_msg = f"{type(e).__name__}: {str(e)}"
-                    await self.adapter.update_status(session_id, SCAN_STATUS_FAILED, error_msg)
-                    logger.error(f"Processing failed: session_id={session_id}, error={error_msg}", exc_info=True)
+                    for session_id, _ in session_db_pairs:
+                        await self.adapter.update_status(session_id, SCAN_STATUS_FAILED, error_msg)
+                    logger.error(f"Building processing failed: building_id={building_id}, error={error_msg}", exc_info=True)
                 
                 finally:
                     self.queue.task_done()

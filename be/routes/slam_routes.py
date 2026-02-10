@@ -33,22 +33,29 @@ async def process_slam(request: SLAMProcessRequest):
     if postgres_adapter is None or job_queue is None:
         raise HTTPException(status_code=500, detail="Service not initialized")
     
-    session = await postgres_adapter.get_session(request.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail=f"Session {request.session_id} not found")
+    sessions = await postgres_adapter.get_sessions_by_building_id(request.building_id)
+    if not sessions:
+        raise HTTPException(status_code=404, detail=f"No sessions found for building {request.building_id}")
     
-    file_path = session.get("file_path")
-    if not file_path:
-        raise HTTPException(status_code=404, detail=f"No file_path for session {request.session_id}")
+    session_db_pairs = []
+    for session in sessions:
+        file_path = session.get("file_path")
+        if not file_path:
+            logger.warning(f"[SLAM-PROCESS] Session {session['id']} has no file_path, skipping")
+            continue
+        session_db_pairs.append((session["id"], file_path))
     
-    logger.info(f"[SLAM-PROCESS] Enqueuing session: {request.session_id}, file: {file_path}")
+    if not session_db_pairs:
+        raise HTTPException(status_code=404, detail=f"No uploadedfiles found for building {request.building_id}")
+    
+    logger.info(f"[SLAM-PROCESS] Enqueuing building: {request.building_id}, sessions: {len(session_db_pairs)}")
     
     try:
-        await job_queue.enqueue(request.session_id, file_path)
+        await job_queue.enqueue(request.building_id, session_db_pairs)
         
         return SLAMProcessResponse(
-            map_id=request.session_id,
-            status=session.get("status", "UPLOADED"),
+            map_id=request.building_id,
+            status="PROCESSING",
             queue_position=job_queue.get_queue_length()
         )
     except Exception as e:
@@ -56,21 +63,36 @@ async def process_slam(request: SLAMProcessRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/status/{session_id}")
-async def get_slam_status(session_id: str):
+@router.get("/status/{building_id}")
+async def get_slam_status(building_id: str):
     if postgres_adapter is None:
         raise HTTPException(status_code=500, detail="Service not initialized")
     
-    session = await postgres_adapter.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    sessions = await postgres_adapter.get_sessions_by_building_id(building_id)
+    if not sessions:
+        raise HTTPException(status_code=404, detail=f"No sessions found for building {building_id}")
     
-    if session.get("created_at"):
-        session["created_at"] = session["created_at"].isoformat()
-    if session.get("updated_at"):
-        session["updated_at"] = session["updated_at"].isoformat()
+    for s in sessions:
+        if s.get("created_at"):
+            s["created_at"] = s["created_at"].isoformat()
+        if s.get("updated_at"):
+            s["updated_at"] = s["updated_at"].isoformat()
     
-    return session
+    statuses = [s.get("status") for s in sessions]
+    if all(st == "COMPLETED" for st in statuses):
+        overall_status = "COMPLETED"
+    elif any(st == "FAILED" for st in statuses):
+        overall_status = "FAILED"
+    elif any(st == "PROCESSING" for st in statuses):
+        overall_status = "PROCESSING"
+    else:
+        overall_status = "UPLOADED"
+    
+    return {
+        "building_id": building_id,
+        "overall_status": overall_status,
+        "sessions": sessions,
+    }
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -89,17 +111,17 @@ async def health_check():
     )
 
 
-@router.get("/maps/{session_id}/metadata", response_model=MapMetadata)
-async def get_map_metadata(session_id: str):
+@router.get("/maps/{building_id}/metadata", response_model=MapMetadata)
+async def get_map_metadata(building_id: str):
     if postgres_adapter is None:
         raise HTTPException(status_code=500, detail="Service not initialized")
     
-    session = await postgres_adapter.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    sessions = await postgres_adapter.get_sessions_by_building_id(building_id)
+    if not sessions:
+        raise HTTPException(status_code=404, detail=f"No sessions found for building {building_id}")
     
     num_keyframes = 0
-    db_path = settings.MAPS_DIR / f"{session_id}.db"
+    db_path = settings.MAPS_DIR / f"{building_id}.db"
     if db_path.exists():
         try:
             parser = DatabaseParser()
@@ -108,14 +130,28 @@ async def get_map_metadata(session_id: str):
         except Exception as e:
             logger.warning(f"[SLAM-METADATA] Failed to parse database: {e}")
     
-    created_at = session["created_at"].isoformat() if session.get("created_at") else ""
+    earliest_created = min(
+        (s["created_at"] for s in sessions if s.get("created_at")),
+        default=None,
+    )
+    created_at = earliest_created.isoformat() if earliest_created else ""
+    
+    statuses = [s.get("status") for s in sessions]
+    if all(st == "COMPLETED" for st in statuses):
+        overall_status = "COMPLETED"
+    elif any(st == "FAILED" for st in statuses):
+        overall_status = "FAILED"
+    elif any(st == "PROCESSING" for st in statuses):
+        overall_status = "PROCESSING"
+    else:
+        overall_status = "UPLOADED"
     
     return MapMetadata(
-        map_id=session_id,
-        session_id=session_id,
+        map_id=building_id,
+        building_id=building_id,
         num_keyframes=num_keyframes,
         created_at=created_at,
-        status=session.get("status", "")
+        status=overall_status,
     )
 
 
