@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import math
 import shutil
@@ -24,18 +25,14 @@ def _compute_trajectory_distance(keyframes: list) -> float:
 
 
 class SLAMJobQueue:
-    _instance = None
-    
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-    
+    """Async job queue for SLAM processing.
+
+    NOT a singleton — lifespan manages the single instance.
+    Previous singleton pattern caused worker stalls on lifespan restart
+    because __init__ was skipped and the dead worker_task was reused.
+    """
+
     def __init__(self, postgres_adapter, slam_engine, maps_dir: Path):
-        if hasattr(self, '_initialized'):
-            return
-        self._initialized = True
-        
         self.adapter = postgres_adapter
         self.engine = slam_engine
         self.maps_dir = maps_dir
@@ -43,7 +40,8 @@ class SLAMJobQueue:
         self.queue: asyncio.Queue = asyncio.Queue()
         self.worker_task: Optional[asyncio.Task] = None
         self._shutdown_flag = False
-        
+
+        print("[SLAMJobQueue] initialized")
         logger.info("SLAMJobQueue initialized")
     
     async def enqueue(self, building_id: str, session_db_pairs: List[Tuple[str, str]]):
@@ -54,9 +52,10 @@ class SLAMJobQueue:
         logger.info(f"Job enqueued: building_id={building_id}, sessions={len(session_db_pairs)}, queue_length={self.queue.qsize()}")
     
     async def start_worker(self):
-        if self.worker_task is not None:
+        if self.worker_task is not None and not self.worker_task.done():
             raise RuntimeError("Worker already running")
         self.worker_task = asyncio.create_task(self._worker_loop())
+        print("[SLAMJobQueue] worker started")
         logger.info("SLAM job queue worker started")
     
     async def _process_session(self, session_id: str, input_db_path: str) -> dict:
@@ -91,22 +90,13 @@ class SLAMJobQueue:
             raise FileNotFoundError(f"Input DB not found: {input_db_path}")
 
         tmp_input = self.tmp_dir / f"{session_id}_input.db"
+        loop = asyncio.get_running_loop()
 
         try:
-            shutil.copy2(str(src), str(tmp_input))
+            await loop.run_in_executor(
+                None, functools.partial(shutil.copy2, str(src), str(tmp_input))
+            )
             logger.info(f"Copied input DB to {tmp_input} ({src.stat().st_size} bytes)")
-
-            # -- reprocess 비활성화 ------------------------------------------------
-            # 업로드된 .db는 이미 완성된 RTABMap DB이므로 reprocess 불필요.
-            # 아래 코드는 향후 raw DB를 받게 될 경우를 위해 남겨둠.
-            #
-            # tmp_output = self.tmp_dir / f"{session_id}_output.db"
-            # await self.engine._run_reprocess(
-            #     str(tmp_input), str(tmp_output), progress_callback=None
-            # )
-            # parsed = await self.engine.database_parser.parse_database(str(tmp_output))
-            # map_binary = await self.engine._load_map_file(str(tmp_output))
-            # ------------------------------------------------------------------
 
             parsed = await self.engine.database_parser.parse_database(str(tmp_input))
             total_nodes = parsed.get('num_keyframes', 0)
@@ -128,9 +118,11 @@ class SLAMJobQueue:
                     pass
     
     async def _worker_loop(self):
+        print("[SLAMJobQueue] worker loop running, waiting for jobs...")
         while True:
             try:
                 building_id, session_db_pairs = await self.queue.get()
+                print(f"[SLAMJobQueue] job dequeued: building_id={building_id}")
                 logger.info(f"Job dequeued: building_id={building_id}, sessions={len(session_db_pairs)}, remaining={self.queue.qsize()}")
                 
                 try:
