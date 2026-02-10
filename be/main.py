@@ -1,4 +1,5 @@
 # main.py
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -14,6 +15,8 @@ from routes import scan, localize, path, viewer, maps, slam_routes
 from storage.postgres_adapter import PostgresAdapter
 from utils.job_queue import SLAMJobQueue
 from utils.temp_file_manager import cleanup_orphaned_temps
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -63,11 +66,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print(f"\n{'='*60}")
-print(f"  {settings.API_TITLE}")
-print(f"  SLAM Engine: {settings.SLAM_ENGINE_TYPE}")
-print(f"  Available: {SLAMEngineFactory.list_engines()}")
-print(f"{'='*60}\n")
+logger.info(f"{settings.API_TITLE} | SLAM Engine: {settings.SLAM_ENGINE_TYPE} | Available: {SLAMEngineFactory.list_engines()}")
 
 # 라우터 등록
 app.include_router(scan.router)
