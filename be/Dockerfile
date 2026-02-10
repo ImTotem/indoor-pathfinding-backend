@@ -8,7 +8,12 @@ RUN apt-get update && apt-get install -y \
     libsm6 \
     libxext6 \
     libxrender-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Docker CLI (needed to exec into rtabmap container)
+RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
+    | tar xz --strip-components=1 -C /usr/local/bin docker/docker
 
 # Set working directory
 WORKDIR /app

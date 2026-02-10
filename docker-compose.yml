@@ -41,6 +41,7 @@ services:
     volumes:
       - ./be/data:/app/data
       - ../indoor-pathfinding-backend/storage/uploads:/app/storage/uploads:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - rtabmap
     restart: unless-stopped
