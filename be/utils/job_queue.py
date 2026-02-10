@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from config.settings import settings
-from storage.postgres_adapter import SCAN_STATUS_PROCESSING, SCAN_STATUS_FAILED
+from storage.postgres_adapter import SCAN_STATUS_PROCESSING, SCAN_STATUS_COMPLETED, SCAN_STATUS_FAILED
 
 logger = logging.getLogger(__name__)
 
@@ -60,34 +60,60 @@ class SLAMJobQueue:
         logger.info("SLAM job queue worker started")
     
     async def _process_session(self, session_id: str, input_db_path: str) -> dict:
-        """The input .db (uploaded by Spring Boot) lives in /app/storage/uploads/
-        which is NOT mounted into the rtabmap container. So we copy it to
-        DATA_DIR/tmp/ (mapped as /data/tmp/ in rtabmap), reprocess there,
-        then parse + load the result.
+        """Parse an already-processed RTABMap .db uploaded via Spring Boot.
+
+        The uploaded .db is a complete RTABMap database (nodes with poses,
+        odometry/loop-closure links, images, depth, calibration) produced by
+        the custom RTABMap app on the mobile device.  Because it is already
+        fully processed, we only need to parse metadata and copy the map —
+        running rtabmap-reprocess would *break* the data (all frames become
+        lost=true since -odom tries to recompute odometry from scratch).
+
+        The file is copied to DATA_DIR/tmp/ so that the rtabmap container
+        can reach it if we ever need reprocessing in the future.
+
+        TODO: If the uploaded .db ever changes to raw data (images + depth
+              only, no odometry links), re-enable _run_reprocess here:
+              >>> await self.engine._run_reprocess(
+              ...     str(tmp_input), str(tmp_output), progress_callback=None
+              ... )
+              >>> parsed = await self.engine.database_parser.parse_database(str(tmp_output))
+              >>> map_binary = await self.engine._load_map_file(str(tmp_output))
+              Also note: _run_reprocess has a pipe deadlock bug where
+              process.wait() hangs because stderr is never drained concurrently.
+              If re-enabling, replace the engine call with a direct subprocess
+              using process.communicate() to avoid the hang.
         """
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
-        
+
         src = Path(input_db_path)
         if not src.exists():
             raise FileNotFoundError(f"Input DB not found: {input_db_path}")
-        
+
         tmp_input = self.tmp_dir / f"{session_id}_input.db"
-        tmp_output = self.tmp_dir / f"{session_id}_output.db"
-        
+
         try:
             shutil.copy2(str(src), str(tmp_input))
             logger.info(f"Copied input DB to {tmp_input} ({src.stat().st_size} bytes)")
-            
-            await self.engine._run_reprocess(
-                str(tmp_input), str(tmp_output), progress_callback=None
-            )
-            
-            parsed = await self.engine.database_parser.parse_database(str(tmp_output))
+
+            # -- reprocess 비활성화 ------------------------------------------------
+            # 업로드된 .db는 이미 완성된 RTABMap DB이므로 reprocess 불필요.
+            # 아래 코드는 향후 raw DB를 받게 될 경우를 위해 남겨둠.
+            #
+            # tmp_output = self.tmp_dir / f"{session_id}_output.db"
+            # await self.engine._run_reprocess(
+            #     str(tmp_input), str(tmp_output), progress_callback=None
+            # )
+            # parsed = await self.engine.database_parser.parse_database(str(tmp_output))
+            # map_binary = await self.engine._load_map_file(str(tmp_output))
+            # ------------------------------------------------------------------
+
+            parsed = await self.engine.database_parser.parse_database(str(tmp_input))
             total_nodes = parsed.get('num_keyframes', 0)
             total_distance = _compute_trajectory_distance(parsed.get('keyframes', []))
-            
-            map_binary = await self.engine._load_map_file(str(tmp_output))
-            
+
+            map_binary = await self.engine._load_map_file(str(tmp_input))
+
             return {
                 'binary': map_binary,
                 'total_nodes': total_nodes,
@@ -95,7 +121,7 @@ class SLAMJobQueue:
                 'parsed': parsed,
             }
         finally:
-            for f in (tmp_input, tmp_output):
+            for f in (tmp_input,):
                 try:
                     f.unlink(missing_ok=True)
                 except Exception:
@@ -130,6 +156,9 @@ class SLAMJobQueue:
                         output_path = self.maps_dir / f"{building_id}.db"
                         output_path.write_bytes(last_result['binary'])
                         logger.info(f"Building map saved: {output_path} ({len(last_result['binary'])} bytes)")
+                    
+                    for session_id, _ in session_db_pairs:
+                        await self.adapter.update_status(session_id, SCAN_STATUS_COMPLETED)
                     
                     logger.info(f"Building processing succeeded: building_id={building_id}")
                     
