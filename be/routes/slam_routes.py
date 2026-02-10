@@ -43,6 +43,11 @@ async def process_slam(request: SLAMProcessRequest):
         if not file_path:
             logger.warning(f"[SLAM-PROCESS] Session {session['id']} has no file_path, skipping")
             continue
+        # Spring Boot stores relative paths like ./storage/uploads/UUID.db
+        # In the web container, uploads are mounted at /app/storage/uploads/
+        if file_path.startswith("./storage/uploads/") or file_path.startswith("storage/uploads/"):
+            filename = file_path.split("/")[-1]
+            file_path = f"/app/storage/uploads/{filename}"
         session_db_pairs.append((session["id"], file_path))
     
     if not session_db_pairs:
