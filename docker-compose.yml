@@ -1,9 +1,11 @@
 services:
   rtabmap:
-    image: introlab3it/rtabmap_ros:noetic-latest
+    image: introlab3it/rtabmap:jammy-cuda
     container_name: rtabmap
     environment:
-      - LD_LIBRARY_PATH=/opt/ros/noetic/lib/x86_64-linux-gnu:/opt/ros/noetic/lib
+      - LD_LIBRARY_PATH=/usr/local/lib
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ./be/data:/data
     working_dir: /data
@@ -11,6 +13,13 @@ services:
     restart: unless-stopped
     networks:
       - indoor-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   web:
     build:
