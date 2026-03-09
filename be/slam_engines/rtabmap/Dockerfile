@@ -55,7 +55,7 @@ RUN git clone --depth 1 --branch 4.8.0 https://github.com/opencv/opencv.git && \
 
 # 3. RTABMap from source
 RUN git clone --depth 1 https://github.com/introlab/rtabmap.git /tmp/rtabmap && \
-    cd /tmp/rtabmap && mkdir build && cd build && \
+    cd /tmp/rtabmap && mkdir -p build && cd build && \
     cmake -D CMAKE_BUILD_TYPE=Release \
           -D CMAKE_INSTALL_PREFIX=/usr/local \
           -D WITH_CUDA=ON \
