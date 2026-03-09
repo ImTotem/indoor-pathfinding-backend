@@ -10,6 +10,7 @@ import struct
 import threading
 import time
 import logging
+from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import cv2
@@ -214,28 +215,14 @@ class MapManager:
             with cls._lock:
                 if cls._instance is None:
                     inst = super().__new__(cls)
-                    inst._maps: Dict[str, LoadedMap] = {}
-                    inst._access_order: List[str] = []
+                    inst._maps: OrderedDict[str, LoadedMap] = OrderedDict()
                     cls._instance = inst
         return cls._instance
-
-    def _touch(self, map_id: str):
-        """Move map_id to end of access order (most recent)."""
-        if map_id in self._access_order:
-            self._access_order.remove(map_id)
-        self._access_order.append(map_id)
-
-    def _evict_if_needed(self):
-        """Evict least-recently-used map if over limit."""
-        while len(self._maps) > MAX_CACHED_MAPS:
-            oldest = self._access_order.pop(0)
-            self._maps.pop(oldest, None)
-            logger.info(f"Map '{oldest}' evicted (LRU, max={MAX_CACHED_MAPS})")
 
     def get_or_load(self, map_id: str) -> LoadedMap:
         """Return cached map or load from disk."""
         if map_id in self._maps:
-            self._touch(map_id)
+            self._maps.move_to_end(map_id)
             return self._maps[map_id]
 
         db_path = settings.MAPS_DIR / f"{map_id}.db"
@@ -243,19 +230,18 @@ class MapManager:
             raise FileNotFoundError(f"Map not found: {map_id}")
 
         self._maps[map_id] = LoadedMap(map_id, str(db_path))
-        self._touch(map_id)
-        self._evict_if_needed()
+        while len(self._maps) > MAX_CACHED_MAPS:
+            evicted_id, _ = self._maps.popitem(last=False)
+            logger.info(f"Map '{evicted_id}' evicted (LRU, max={MAX_CACHED_MAPS})")
+
         return self._maps[map_id]
 
     def unload(self, map_id: str):
         self._maps.pop(map_id, None)
-        if map_id in self._access_order:
-            self._access_order.remove(map_id)
         logger.info(f"Map '{map_id}' unloaded")
 
     def unload_all(self):
         self._maps.clear()
-        self._access_order.clear()
         logger.info("All maps unloaded")
 
     def localize(
