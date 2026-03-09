@@ -196,8 +196,15 @@ def _create_detector(strategy: int, max_features: int = 1000, brief_bytes: int =
         return det, det
 
 
+MAX_CACHED_MAPS = 3  # LRU limit — oldest-accessed map evicted when exceeded
+
+
 class MapManager:
-    """Manages loaded maps in memory for fast relocalization. Singleton."""
+    """Manages loaded maps in memory for fast relocalization. Singleton.
+
+    Uses LRU eviction: when more than MAX_CACHED_MAPS are loaded,
+    the least-recently-used map is automatically unloaded.
+    """
 
     _instance = None
     _lock = threading.Lock()
@@ -208,24 +215,47 @@ class MapManager:
                 if cls._instance is None:
                     inst = super().__new__(cls)
                     inst._maps: Dict[str, LoadedMap] = {}
+                    inst._access_order: List[str] = []
                     cls._instance = inst
         return cls._instance
 
+    def _touch(self, map_id: str):
+        """Move map_id to end of access order (most recent)."""
+        if map_id in self._access_order:
+            self._access_order.remove(map_id)
+        self._access_order.append(map_id)
+
+    def _evict_if_needed(self):
+        """Evict least-recently-used map if over limit."""
+        while len(self._maps) > MAX_CACHED_MAPS:
+            oldest = self._access_order.pop(0)
+            self._maps.pop(oldest, None)
+            logger.info(f"Map '{oldest}' evicted (LRU, max={MAX_CACHED_MAPS})")
+
     def get_or_load(self, map_id: str) -> LoadedMap:
         """Return cached map or load from disk."""
-        if map_id not in self._maps:
-            db_path = settings.MAPS_DIR / f"{map_id}.db"
-            if not db_path.exists():
-                raise FileNotFoundError(f"Map not found: {map_id}")
-            self._maps[map_id] = LoadedMap(map_id, str(db_path))
+        if map_id in self._maps:
+            self._touch(map_id)
+            return self._maps[map_id]
+
+        db_path = settings.MAPS_DIR / f"{map_id}.db"
+        if not db_path.exists():
+            raise FileNotFoundError(f"Map not found: {map_id}")
+
+        self._maps[map_id] = LoadedMap(map_id, str(db_path))
+        self._touch(map_id)
+        self._evict_if_needed()
         return self._maps[map_id]
 
     def unload(self, map_id: str):
         self._maps.pop(map_id, None)
+        if map_id in self._access_order:
+            self._access_order.remove(map_id)
         logger.info(f"Map '{map_id}' unloaded")
 
     def unload_all(self):
         self._maps.clear()
+        self._access_order.clear()
         logger.info("All maps unloaded")
 
     def localize(
