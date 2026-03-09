@@ -1,4 +1,4 @@
-# RTABMap with CUDA + OpenCV CUDA support
+# RTABMap with CUDA + CudaSift + g2o
 # RTX 3060 (Ampere, compute capability 8.6)
 
 FROM nvidia/cuda:12.0.0-devel-ubuntu22.04 AS builder
@@ -20,13 +20,11 @@ RUN apt-get update && apt-get install -y \
     libsuitesparse-dev libgtest-dev \
     libfreenect-dev libdc1394-dev \
     libyaml-cpp-dev liboctomap-dev \
-    # g2o / GTSAM
     libqhull-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. OpenCV 4.8 with CUDA
 WORKDIR /tmp
-
 RUN git clone --depth 1 --branch 4.8.0 https://github.com/opencv/opencv.git && \
     git clone --depth 1 --branch 4.8.0 https://github.com/opencv/opencv_contrib.git && \
     cd opencv && mkdir build && cd build && \
@@ -49,20 +47,41 @@ RUN git clone --depth 1 --branch 4.8.0 https://github.com/opencv/opencv.git && \
           -D OPENCV_GENERATE_PKGCONFIG=ON \
           .. && \
     make -j$(nproc) && \
-    make install && \
-    ldconfig && \
+    make install && ldconfig && \
     cd /tmp && rm -rf opencv opencv_contrib
 
-# 3. RTABMap from source
+# 3. g2o (graph optimizer)
+RUN git clone --depth 1 https://github.com/RainerKuemmerle/g2o.git /tmp/g2o && \
+    cd /tmp/g2o && mkdir -p build && cd build && \
+    cmake -D CMAKE_BUILD_TYPE=Release \
+          -D CMAKE_INSTALL_PREFIX=/usr/local \
+          -D BUILD_WITH_MARCH_NATIVE=OFF \
+          -D G2O_BUILD_EXAMPLES=OFF \
+          -D G2O_BUILD_APPS=OFF \
+          .. && \
+    make -j$(nproc) && \
+    make install && ldconfig && \
+    rm -rf /tmp/g2o
+
+# 4. CudaSift (GPU-accelerated SIFT)
+RUN git clone --depth 1 https://github.com/Celebrandil/CudaSift.git /tmp/CudaSift && \
+    cd /tmp/CudaSift && mkdir -p build && cd build && \
+    cmake -D CMAKE_BUILD_TYPE=Release \
+          -D CMAKE_INSTALL_PREFIX=/usr/local \
+          -D CUDA_ARCH="8.6" \
+          .. && \
+    make -j$(nproc) && \
+    make install && ldconfig && \
+    rm -rf /tmp/CudaSift
+
+# 5. RTABMap from source (with CUDA, CudaSift, g2o)
 RUN git clone --depth 1 https://github.com/introlab/rtabmap.git /tmp/rtabmap && \
     cd /tmp/rtabmap && mkdir -p build && cd build && \
     cmake -D CMAKE_BUILD_TYPE=Release \
           -D CMAKE_INSTALL_PREFIX=/usr/local \
-          -D WITH_CUDA=ON \
           .. && \
     make -j$(nproc) && \
-    make install && \
-    ldconfig && \
+    make install && ldconfig && \
     rm -rf /tmp/rtabmap
 
 # --- Runtime stage ---
@@ -82,18 +101,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsuitesparseconfig5 libcholmod3 libcxsparse3 \
     libyaml-cpp0.7 liboctomap1.9 \
     libfreenect0.5 libdc1394-25 \
+    libeigen3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy built artifacts from builder
 COPY --from=builder /usr/local /usr/local
 RUN ldconfig
 
-# Verify binaries
-RUN rtabmap-reprocess --version || true && \
+# Verify
+RUN rtabmap-reprocess --version && \
     which rtabmap-console && \
     which rtabmap-export
 
 RUN mkdir -p /data
 WORKDIR /data
-
 CMD ["tail", "-f", "/dev/null"]
