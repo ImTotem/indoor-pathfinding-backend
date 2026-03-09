@@ -7,5 +7,5 @@ pillow
 jinja2
 python-dotenv
 numpy
-opencv-python
+opencv-contrib-python
 asyncpg

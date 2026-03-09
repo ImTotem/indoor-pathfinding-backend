@@ -656,194 +656,33 @@ class RTABMapEngine(SLAMEngineBase):
     
     async def localize(self, map_id: str, images: List[bytes], intrinsics: Optional[Dict] = None, initial_pose: Optional[Dict] = None) -> dict:
         """Localize current position using 1-5 query images against existing map.
-        
+
+        Uses in-memory map matching via MapManager for fast relocalization.
+        Map is loaded once on first request and kept in memory.
+
         Args:
             map_id: ID of the RTABMap database to localize against
             images: List of 1-5 image bytes (JPEG/PNG)
-            intrinsics: Optional camera intrinsics (auto-extracted if None)
+            intrinsics: Optional camera intrinsics (for future PnP refinement)
             initial_pose: Optional initial pose estimate (not used)
-        
+
         Returns:
-            dict: {
-                "pose": {"x", "y", "z", "qx", "qy", "qz", "qw"},
-                "confidence": float,
-                "map_id": str,
-                "num_matches": int
-            }
-        
+            dict with pose, confidence, map_id, matched_node_id
+
         Raises:
             FileNotFoundError: Map database not found
-            ValueError: Invalid number of images or processing failed
-            TimeoutError: RTABMap processing timeout (30s)
+            ValueError: Processing failed or insufficient matches
         """
-        # 1. Validate map exists
-        map_path = settings.MAPS_DIR / f"{map_id}.db"
-        if not map_path.exists():
-            raise FileNotFoundError(f"Map not found: {map_id}")
-        
-        # 2. Create temporary session directory for query images
-        session_id = f"reloc_{map_id}_{int(time.time())}"
-        session_dir = settings.SESSIONS_DIR / session_id
-        images_dir = session_dir / "images"
-        images_dir.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            # 3. Save query images
-            for i, img_bytes in enumerate(images, 1):
-                img_path = images_dir / f"query_{i}.jpg"
-                img_path.write_bytes(img_bytes)
-            
-            # 4. Create images.txt (RTABMap input format)
-            images_txt = session_dir / "images.txt"
-            with open(images_txt, 'w') as f:
-                f.write("# timestamp filename\n")
-                for i in range(1, len(images) + 1):
-                    f.write(f"{i} images/query_{i}.jpg\n")
-            
-            # 5. Set relocalization parameters
-            db_params = self.extract_params_from_db(str(map_path))
-            
-            reloc_params = constants.DEFAULT_PARAMS.copy()
-            
-            if 'BRIEF/Bytes' in db_params:
-                reloc_params['BRIEF/Bytes'] = db_params['BRIEF/Bytes']
-                print(f"[RTAB-Map] Using map's BRIEF descriptor size: {db_params['BRIEF/Bytes']} bytes")
-            
-            if 'Kp/DetectorStrategy' in db_params:
-                reloc_params['Kp/DetectorStrategy'] = db_params['Kp/DetectorStrategy']
-            
-            reloc_params["Mem/IncrementalMemory"] = "false"
-            reloc_params["Mem/InitWMWithAllNodes"] = "true"
-            cli_args = self.config_generator.params_to_cli_args(reloc_params)
-            
-            # 6. Invoke rtabmap-console (subprocess CLI)
-            # Correct syntax: rtabmap-console [params] -input existing_map.db images_directory
-            if self.use_docker:
-                c_map_path = self._to_container_path(str(map_path))
-                c_images_dir = self._to_container_path(str(images_dir))
-                
-                rtabmap_cmd = [
-                    "rtabmap-console"
-                ] + cli_args + [
-                    "-input", c_map_path,
-                    c_images_dir
-                ]
-                
-                bash_cmd = " ".join(rtabmap_cmd)
-                cmd = ["docker", "exec", self.container_name, "bash", "-c", bash_cmd]
-            else:
-                # Local mode invocation
-                cmd = [
-                    "rtabmap-console"
-                ] + cli_args + [
-                    "-input", str(map_path),
-                    str(images_dir)
-                ]
-            
-            # 7. Execute with 30-second timeout
-            print(f"[RTAB-Map] Relocalization starting for map {map_id}...")
-            
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(),
-                        timeout=30  # CRITICAL: 30s not 600s
-                    )
-                except asyncio.TimeoutError:
-                    # Kill process on timeout
-                    if self.use_docker and self.container_name:
-                        subprocess.run([
-                            "docker", "exec", self.container_name,
-                            "pkill", "-9", "-f", "rtabmap-console"
-                        ], capture_output=True)
-                    else:
-                        process.kill()
-                    raise TimeoutError("RTABMap relocalization timeout (exceeded 30 seconds)")
-                
-                if process.returncode != 0:
-                    error_msg = stderr.decode('utf-8', errors='ignore')
-                    print(f"[RTAB-Map] Relocalization failed: {error_msg}")
-                    raise ValueError(f"RTABMap processing failed: {error_msg}")
-                
-                # 8. Parse output for matched node ID
-                stdout_str = stdout.decode('utf-8', errors='ignore')
-                print(f"[RTAB-Map] Relocalization output:\n{stdout_str}")
-                
-                # 8a. Parse iteration lines for matched node ID
-                import re
-                matched_node_id = None
-                best_hypothesis = -999.0
-                
-                loop_pattern = re.compile(r'iteration\(\d+\)\s+loop\((\d+)\)\s+hyp\(([-0-9.]+)\)')
-                high_pattern = re.compile(r'iteration\(\d+\)\s+high\((\d+)\)\s+hyp\(([-0-9.]+)\)')
-                
-                for line in stdout_str.split('\n'):
-                    loop_match = loop_pattern.search(line)
-                    if loop_match:
-                        node_id = int(loop_match.group(1))
-                        hypothesis = float(loop_match.group(2))
-                        if hypothesis > best_hypothesis:
-                            best_hypothesis = hypothesis
-                            matched_node_id = node_id
-                        print(f"[RTAB-Map] Loop closure accepted: node={node_id}, hyp={hypothesis}")
-                        continue
-                    
-                    high_match = high_pattern.search(line)
-                    if high_match and matched_node_id is None:
-                        node_id = int(high_match.group(1))
-                        hypothesis = float(high_match.group(2))
-                        if hypothesis > best_hypothesis:
-                            best_hypothesis = hypothesis
-                            matched_node_id = node_id
-                        print(f"[RTAB-Map] Best hypothesis: node={node_id}, hyp={hypothesis}")
-                
-                if matched_node_id is None:
-                    raise ValueError("No loop closure or hypothesis found - relocalization failed")
-                
-                print(f"[RTAB-Map] Final matched node: {matched_node_id} (hypothesis={best_hypothesis})")
-                
-                # 8b. Extract pose from matched node
-                pose = self._extract_node_pose(map_path, matched_node_id)
-                if pose is None:
-                    raise ValueError(f"Failed to extract pose for node {matched_node_id}")
-                
-                # 8c. Calculate confidence from hypothesis value
-                confidence = min(0.9, max(0.1, (best_hypothesis + 1.0) / 2.0))
-                
-                # 9. Return result matching API contract
-                return {
-                    "pose": {
-                        "x": pose[0],
-                        "y": pose[1],
-                        "z": pose[2],
-                        "qx": pose[3],
-                        "qy": pose[4],
-                        "qz": pose[5],
-                        "qw": pose[6]
-                    },
-                    "confidence": confidence,
-                    "map_id": map_id,
-                    "matched_node_id": matched_node_id
-                }
-            
-            except FileNotFoundError:
-                raise Exception("rtabmap-console not found - is RTABMap installed?")
-            except Exception as e:
-                if isinstance(e, (FileNotFoundError, ValueError, TimeoutError)):
-                    raise
-                raise Exception(f"RTABMap relocalization failed: {e}")
-        
-        finally:
-            # 10. Clean up temporary files
-            if session_dir.exists():
-                shutil.rmtree(session_dir)
-                print(f"[RTAB-Map] Cleaned up temporary session: {session_id}")
+        import asyncio
+        import functools
+        from .map_manager import MapManager
+
+        mgr = MapManager()
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, functools.partial(mgr.localize, map_id, images, intrinsics)
+        )
+        return result
     
     def _parse_localization_output(self, stdout: str) -> tuple:
         """Parse RTABMap stdout for pose and confidence.
