@@ -1,6 +1,9 @@
 services:
   rtabmap:
-    image: introlab3it/rtabmap:jammy-cuda
+    build:
+      context: ./be/slam_engines/rtabmap
+      dockerfile: Dockerfile
+    image: rtabmap-cuda:latest
     container_name: rtabmap
     environment:
       - LD_LIBRARY_PATH=/usr/local/lib
