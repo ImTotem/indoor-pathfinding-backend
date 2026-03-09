@@ -63,22 +63,12 @@ RUN git clone --depth 1 https://github.com/RainerKuemmerle/g2o.git /tmp/g2o && \
     make install && ldconfig && \
     rm -rf /tmp/g2o
 
-# 4. CudaSift (GPU-accelerated SIFT)
-RUN git clone --depth 1 https://github.com/Celebrandil/CudaSift.git /tmp/CudaSift && \
-    cd /tmp/CudaSift && mkdir -p build && cd build && \
-    cmake -D CMAKE_BUILD_TYPE=Release \
-          -D CMAKE_INSTALL_PREFIX=/usr/local \
-          -D CUDA_ARCH="8.6" \
-          .. && \
-    make -j$(nproc) && \
-    make install && ldconfig && \
-    rm -rf /tmp/CudaSift
-
-# 5. RTABMap from source (with CUDA, CudaSift, g2o)
+# 4. RTABMap from source (with OpenCV CUDA, g2o)
 RUN git clone --depth 1 https://github.com/introlab/rtabmap.git /tmp/rtabmap && \
     cd /tmp/rtabmap && mkdir -p build && cd build && \
     cmake -D CMAKE_BUILD_TYPE=Release \
           -D CMAKE_INSTALL_PREFIX=/usr/local \
+          -D g2o_DIR=/usr/local/lib/cmake/g2o \
           .. && \
     make -j$(nproc) && \
     make install && ldconfig && \
