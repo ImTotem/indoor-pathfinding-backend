@@ -32,20 +32,12 @@ class SLAMLocalizeRequest(BaseModel):
         return v
 
 
-class MatchedNode(BaseModel):
-    query_index: int
-    node_id: int
-    match_count: int
-    confidence: float
-    pose: dict
-
-
 class SLAMLocalizeResponse(BaseModel):
     pose: dict
     confidence: float
-    map_id: str = ""
-    matched_node_id: int = 0
-    all_matches: List[MatchedNode] = []
+    mapId: str = ""
+    numMatches: int = 0
+    matchedImageIndex: int = 0
 
 
 class MapMetadata(BaseModel):

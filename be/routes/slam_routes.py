@@ -201,9 +201,9 @@ async def localize_in_map(request: SLAMLocalizeRequest):
         return SLAMLocalizeResponse(
             pose=result['pose'],
             confidence=result['confidence'],
-            map_id=result.get('map_id', request.map_id),
-            matched_node_id=result.get('matched_node_id', 0),
-            all_matches=result.get('all_matches', []),
+            mapId=result.get('map_id', request.map_id),
+            numMatches=result.get('num_matches', 0),
+            matchedImageIndex=result.get('matched_image_index', 0),
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))

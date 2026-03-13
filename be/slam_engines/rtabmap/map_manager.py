@@ -337,6 +337,6 @@ class MapManager:
             "pose": best["pose"],
             "confidence": best["confidence"],
             "map_id": map_id,
-            "matched_node_id": best["node_id"],
-            "all_matches": all_matches,
+            "num_matches": best["match_count"],
+            "matched_image_index": best["query_index"],
         }
