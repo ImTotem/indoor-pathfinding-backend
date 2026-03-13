@@ -27,8 +27,8 @@ class SLAMLocalizeRequest(BaseModel):
     @field_validator('images')
     @classmethod
     def validate_images(cls, v: list) -> list:
-        if not (1 <= len(v) <= 5):
-            raise ValueError('Must provide 1-5 images')
+        if len(v) < 1:
+            raise ValueError('Must provide at least 1 image')
         return v
 
 

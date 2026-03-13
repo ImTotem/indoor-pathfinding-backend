@@ -27,10 +27,10 @@ async def localize(
         - num_matches: int
     """
     
-    if not (1 <= len(images) <= 5):
+    if len(images) < 1:
         raise HTTPException(
             status_code=400,
-            detail="1개에서 5개 사이의 이미지를 제공해야 합니다"
+            detail="최소 1개 이상의 이미지를 제공해야 합니다"
         )
     
     try:
