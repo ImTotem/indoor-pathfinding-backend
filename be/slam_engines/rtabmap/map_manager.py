@@ -267,10 +267,10 @@ class MapManager:
         )
         matcher = cv2.BFMatcher(loaded.norm_type, crossCheck=False)
 
-        best_node_id = None
-        best_vote_count = 0
+        # Collect per-query-image matching results
+        all_matches = []
 
-        for img_bytes in images:
+        for query_idx, img_bytes in enumerate(images):
             img = cv2.imdecode(
                 np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_GRAYSCALE
             )
@@ -293,37 +293,50 @@ class MapManager:
             if not good:
                 continue
 
-            # Vote for best node
+            # Vote for nodes
             votes: Dict[int, int] = {}
             for m in good:
                 nid = int(loaded.descriptor_node_ids[m.trainIdx])
                 votes[nid] = votes.get(nid, 0) + 1
 
-            top_node = max(votes, key=votes.get)
-            if votes[top_node] > best_vote_count:
-                best_vote_count = votes[top_node]
-                best_node_id = top_node
+            # Collect all nodes above min_inliers for this query image
+            for nid, count in sorted(votes.items(), key=lambda x: x[1], reverse=True):
+                if count < loaded.min_inliers:
+                    continue
+                pose = loaded.node_poses.get(nid)
+                if pose is None:
+                    continue
+                all_matches.append({
+                    "query_index": query_idx,
+                    "node_id": nid,
+                    "match_count": count,
+                    "confidence": min(0.9, max(0.1, count / loaded.max_features)),
+                    "pose": {
+                        "x": pose[0], "y": pose[1], "z": pose[2],
+                        "qx": pose[3], "qy": pose[4], "qz": pose[5], "qw": pose[6],
+                    },
+                })
 
-        if best_node_id is None or best_vote_count < loaded.min_inliers:
+        if not all_matches:
             raise ValueError(
-                f"insufficient feature matches for reliable relocalization "
-                f"(best={best_vote_count}, min_required={loaded.min_inliers})"
+                "insufficient feature matches for reliable relocalization"
             )
 
-        pose = loaded.node_poses[best_node_id]
-        confidence = min(0.9, max(0.1, best_vote_count / loaded.max_features))
+        # Best match = highest match_count overall
+        best = all_matches[0]
+        for m in all_matches[1:]:
+            if m["match_count"] > best["match_count"]:
+                best = m
 
         logger.info(
-            f"Relocalized on map '{map_id}': node={best_node_id}, "
-            f"matches={best_vote_count}, confidence={confidence:.2f}"
+            f"Relocalized on map '{map_id}': best_node={best['node_id']}, "
+            f"matches={best['match_count']}, total_matched_nodes={len(all_matches)}"
         )
 
         return {
-            "pose": {
-                "x": pose[0], "y": pose[1], "z": pose[2],
-                "qx": pose[3], "qy": pose[4], "qz": pose[5], "qw": pose[6],
-            },
-            "confidence": confidence,
+            "pose": best["pose"],
+            "confidence": best["confidence"],
             "map_id": map_id,
-            "matched_node_id": best_node_id,
+            "matched_node_id": best["node_id"],
+            "all_matches": all_matches,
         }

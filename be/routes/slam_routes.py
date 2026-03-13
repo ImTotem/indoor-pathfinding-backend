@@ -198,7 +198,13 @@ async def localize_in_map(request: SLAMLocalizeRequest):
     
     try:
         result = await slam_engine.localize(request.map_id, image_bytes_list, intrinsics=intrinsics)
-        return SLAMLocalizeResponse(pose=result['pose'], confidence=result['confidence'])
+        return SLAMLocalizeResponse(
+            pose=result['pose'],
+            confidence=result['confidence'],
+            map_id=result.get('map_id', request.map_id),
+            matched_node_id=result.get('matched_node_id', 0),
+            all_matches=result.get('all_matches', []),
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except TimeoutError:
