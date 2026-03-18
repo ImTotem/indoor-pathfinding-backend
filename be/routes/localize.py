@@ -1,7 +1,7 @@
 # routes/localize.py
 from fastapi import APIRouter, HTTPException, File, Form, UploadFile
 from typing import List
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 
 from slam_interface.factory import SLAMEngineFactory
@@ -64,11 +64,12 @@ async def localize(
             detail=f"Failed to extract intrinsics from map {map_id}: {str(e)}"
         )
     
-    # Get first image resolution
+    # Get first image resolution (after EXIF orientation correction)
     try:
         first_image = Image.open(io.BytesIO(image_bytes[0]))
+        first_image = ImageOps.exif_transpose(first_image)
         img_width, img_height = first_image.size
-        print(f"[Localize] Query image resolution: {img_width}x{img_height}")
+        print(f"[Localize] Query image resolution (EXIF corrected): {img_width}x{img_height}")
     except Exception as e:
         raise HTTPException(
             status_code=400,
