@@ -30,25 +30,27 @@ def _decode_image_with_exif(img_bytes: bytes) -> Optional[np.ndarray]:
     appear rotated. This function uses PIL to apply EXIF orientation first,
     then converts to OpenCV grayscale format.
 
-    CLAHE is applied to normalize contrast across lighting conditions,
-    improving feature detection in low-light (nighttime) scenarios.
+    Pipeline: RGB → Zero-DCE enhance (if dark) → grayscale → CLAHE
     """
     try:
         pil_img = Image.open(io.BytesIO(img_bytes))
-        # Apply EXIF orientation (transpose if needed)
         from PIL import ImageOps
         pil_img = ImageOps.exif_transpose(pil_img)
-        # Convert to grayscale numpy array
-        pil_gray = pil_img.convert("L")
-        gray = np.array(pil_gray, dtype=np.uint8)
+        rgb = np.array(pil_img.convert("RGB"), dtype=np.uint8)
     except Exception:
-        # Fallback to cv2 if PIL fails
-        gray = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+        bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            return None
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    if gray is None:
-        return None
+    # Zero-DCE low-light enhancement (skipped if image is bright enough)
+    from .low_light_enhancer import LowLightEnhancer
+    rgb = LowLightEnhancer().enhance(rgb)
 
-    # CLAHE: normalize contrast for robust feature detection under any lighting
+    # Convert to grayscale
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    # CLAHE: normalize contrast for robust feature detection
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(gray)
 
