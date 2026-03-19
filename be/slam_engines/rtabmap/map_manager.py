@@ -29,6 +29,9 @@ def _decode_image_with_exif(img_bytes: bytes) -> Optional[np.ndarray]:
     cv2.imdecode ignores EXIF rotation tags, so portrait photos taken on phones
     appear rotated. This function uses PIL to apply EXIF orientation first,
     then converts to OpenCV grayscale format.
+
+    CLAHE is applied to normalize contrast across lighting conditions,
+    improving feature detection in low-light (nighttime) scenarios.
     """
     try:
         pil_img = Image.open(io.BytesIO(img_bytes))
@@ -37,10 +40,17 @@ def _decode_image_with_exif(img_bytes: bytes) -> Optional[np.ndarray]:
         pil_img = ImageOps.exif_transpose(pil_img)
         # Convert to grayscale numpy array
         pil_gray = pil_img.convert("L")
-        return np.array(pil_gray, dtype=np.uint8)
+        gray = np.array(pil_gray, dtype=np.uint8)
     except Exception:
         # Fallback to cv2 if PIL fails
-        return cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+        gray = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+
+    if gray is None:
+        return None
+
+    # CLAHE: normalize contrast for robust feature detection under any lighting
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
 
 
 # RTABMap detector strategies that use binary descriptors
