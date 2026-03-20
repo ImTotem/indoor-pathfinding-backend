@@ -222,3 +222,89 @@ class PostgresAdapter:
             return "connected"
         except Exception as e:
             return f"error: {str(e)}"
+
+    async def ensure_path_nodes_schema(self):
+        """Ensure path_nodes/POI schema exists for shared Spring schema compatibility."""
+        async def _create():
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS path_nodes (
+                        id UUID PRIMARY KEY,
+                        floor_id UUID NOT NULL,
+                        x DOUBLE PRECISION NOT NULL,
+                        y DOUBLE PRECISION NOT NULL,
+                        z DOUBLE PRECISION NOT NULL,
+                        type VARCHAR(50) NOT NULL,
+                        poi_name VARCHAR(255),
+                        poi_category VARCHAR(100),
+                        vertical_passage_id UUID,
+                        is_passage_entry BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_path_nodes_floor ON path_nodes (floor_id);
+                    CREATE INDEX IF NOT EXISTS idx_path_nodes_poi_name ON path_nodes (poi_name);
+                    CREATE INDEX IF NOT EXISTS idx_path_nodes_coordinates ON path_nodes (x, y, z);
+                    """
+                )
+        await self._retry(_create)
+
+    async def get_nearest_pois(
+        self,
+        floor_id: str,
+        x: float,
+        y: float,
+        z: float,
+        max_distance: float = 5.0,
+        limit: int = 10
+    ) -> List[dict]:
+        """Get nearby POI nodes for a floor + position."""
+        async def _fetch():
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, floor_id, x, y, z, poi_name, poi_category,
+                           SQRT(POWER(x - $1, 2) + POWER(y - $2, 2) + POWER(z - $3, 2)) AS distance
+                    FROM path_nodes
+                    WHERE floor_id = $4
+                      AND poi_name IS NOT NULL
+                      AND SQRT(POWER(x - $1, 2) + POWER(y - $2, 2) + POWER(z - $3, 2)) <= $5
+                    ORDER BY distance ASC
+                    LIMIT $6
+                    """,
+                    x, y, z, uuid.UUID(floor_id), max_distance, limit
+                )
+                return [
+                    {
+                        "id": str(r["id"]),
+                        "floor_id": str(r["floor_id"]),
+                        "x": float(r["x"]),
+                        "y": float(r["y"]),
+                        "z": float(r["z"]),
+                        "poi_name": r["poi_name"],
+                        "poi_category": r["poi_category"],
+                        "distance": float(r["distance"]),
+                    }
+                    for r in rows
+                ]
+        return await self._retry(_fetch)
+
+    async def get_preview_image_path(self, building_id: str) -> Optional[str]:
+        """Get latest available preview image path for a building's completed scan session."""
+        async def _fetch():
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT preview_image_path
+                    FROM scan_sessions
+                    WHERE building_id = $1
+                      AND preview_image_path IS NOT NULL
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    uuid.UUID(building_id)
+                )
+                return row["preview_image_path"] if row else None
+        return await self._retry(_fetch)
+

@@ -10,7 +10,7 @@ from config.settings import settings
 from slam_interface.factory import SLAMEngineFactory
 import slam_engines  # 엔진 자동 등록
 
-from routes import scan, localize, path, viewer, maps, slam_routes
+from routes import scan, localize, path, viewer, maps, slam_routes, navigation_ws
 from storage.postgres_adapter import PostgresAdapter
 from utils.job_queue import SLAMJobQueue
 from utils.temp_file_manager import cleanup_orphaned_temps
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     
     postgres_adapter = PostgresAdapter(pool)
     slam_routes.postgres_adapter = postgres_adapter
-    
+
     slam_engine = SLAMEngineFactory.create(settings.SLAM_ENGINE_TYPE)
     job_queue = SLAMJobQueue(postgres_adapter, slam_engine, settings.MAPS_DIR)
     slam_routes.job_queue = job_queue
@@ -76,6 +76,7 @@ app.include_router(path.router)
 app.include_router(viewer.router)
 app.include_router(maps.router)
 app.include_router(slam_routes.router)
+app.include_router(navigation_ws.router)
 
 @app.get("/")
 async def root():
