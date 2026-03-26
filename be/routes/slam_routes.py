@@ -162,8 +162,16 @@ async def get_map_metadata(building_id: str):
 
 @router.post("/localize", response_model=SLAMLocalizeResponse, status_code=status.HTTP_200_OK)
 async def localize_in_map(request: SLAMLocalizeRequest):
-    logger.info(f"[SLAM-LOCALIZE] map_id: {request.map_id}")
-    
+    """Localize against all floors of a building in parallel.
+
+    map_id is treated as building_id. The endpoint discovers all floor
+    merged DBs and searches them concurrently, returning the result
+    with the highest confidence (ties broken by num_matches).
+    """
+    building_id = request.map_id
+    logger.info(f"[SLAM-LOCALIZE] building_id: {building_id}")
+
+    # --- decode images ---
     try:
         image_bytes_list = []
         for i, img_b64 in enumerate(request.images):
@@ -173,43 +181,92 @@ async def localize_in_map(request: SLAMLocalizeRequest):
                 raise ValueError(f"Invalid base64 in image {i+1}: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
+
+    # --- discover floor maps ---
+    floor_maps = []
+    if postgres_adapter is not None:
+        floor_maps = await postgres_adapter.get_floor_maps(building_id)
+
+    if not floor_maps:
+        # Fallback: single DB in MAPS_DIR (backward compatibility)
+        single_db = settings.MAPS_DIR / f"{building_id}.db"
+        if single_db.exists():
+            floor_maps = [{"floor_id": "", "floor_name": "", "level": 0, "file_path": str(single_db)}]
+        else:
+            raise HTTPException(status_code=404, detail=f"No maps found for building {building_id}")
+
+    # --- resolve DB paths ---
     slam_engine = SLAMEngineFactory.create(settings.SLAM_ENGINE_TYPE)
-    
-    db_path = settings.MAPS_DIR / f"{request.map_id}.db"
-    try:
-        intrinsics = slam_engine.extract_intrinsics_from_db(str(db_path))
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Map not found: {request.map_id}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to extract intrinsics: {e}")
-    
+
+    resolved_floors = []
+    for fm in floor_maps:
+        fp = fm["file_path"]
+        if fp.startswith("./storage/uploads/") or fp.startswith("storage/uploads/"):
+            filename = fp.split("/")[-1]
+            fp = f"/app/storage/uploads/{filename}"
+        resolved_floors.append({**fm, "file_path": fp})
+
+    # --- extract intrinsics from first available DB ---
+    intrinsics = None
+    for fm in resolved_floors:
+        try:
+            intrinsics = slam_engine.extract_intrinsics_from_db(fm["file_path"])
+            break
+        except Exception:
+            continue
+
+    if intrinsics is None:
+        raise HTTPException(status_code=500, detail="Failed to extract intrinsics from any floor DB")
+
     try:
         img = Image.open(io.BytesIO(image_bytes_list[0]))
         img_width, img_height = img.size
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image data: {e}")
-    
+
     if (img_width, img_height) != (intrinsics['width'], intrinsics['height']):
+        intrinsics = slam_engine.scale_intrinsics(intrinsics, img_width, img_height)
+
+    # --- localize against all floors in parallel ---
+    import asyncio
+
+    async def _localize_floor(fm: dict) -> dict:
         try:
-            intrinsics = slam_engine.scale_intrinsics(intrinsics, img_width, img_height)
+            result = await slam_engine.localize(
+                fm["floor_id"], image_bytes_list,
+                intrinsics=intrinsics, db_path=fm["file_path"],
+            )
+            result["floor_id"] = fm["floor_id"]
+            result["floor_name"] = fm["floor_name"]
+            result["floor_level"] = fm["level"]
+            return result
+        except (FileNotFoundError, ValueError) as e:
+            logger.debug(f"[SLAM-LOCALIZE] Floor {fm['floor_name']}: {e}")
+            return None
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to scale intrinsics: {e}")
-    
-    try:
-        result = await slam_engine.localize(request.map_id, image_bytes_list, intrinsics=intrinsics)
-        return SLAMLocalizeResponse(
-            pose=result['pose'],
-            confidence=result['confidence'],
-            mapId=result.get('map_id', request.map_id),
-            numMatches=result.get('num_matches', 0),
-            matchedImageIndex=result.get('matched_image_index', 0),
-        )
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except TimeoutError:
-        raise HTTPException(status_code=503, detail="Localization timeout (30s)")
-    except ValueError as e:
-        raise HTTPException(status_code=503, detail=f"Localization failed: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+            logger.warning(f"[SLAM-LOCALIZE] Floor {fm['floor_name']} error: {e}")
+            return None
+
+    results = await asyncio.gather(*[_localize_floor(fm) for fm in resolved_floors])
+    valid = [r for r in results if r is not None]
+
+    if not valid:
+        raise HTTPException(status_code=503, detail="Localization failed on all floors")
+
+    # Best = highest confidence, tiebreak by num_matches
+    best = max(valid, key=lambda r: (r["confidence"], r.get("num_matches", 0)))
+
+    logger.info(
+        f"[SLAM-LOCALIZE] Best: floor={best.get('floor_name')}, "
+        f"confidence={best['confidence']:.2f}, matches={best.get('num_matches', 0)}"
+    )
+
+    return SLAMLocalizeResponse(
+        pose=best["pose"],
+        confidence=best["confidence"],
+        mapId=building_id,
+        numMatches=best.get("num_matches", 0),
+        matchedImageIndex=best.get("matched_image_index", 0),
+        floorId=best.get("floor_id", ""),
+        floorLevel=best.get("floor_level", 0),
+    )

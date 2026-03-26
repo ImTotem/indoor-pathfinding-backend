@@ -290,6 +290,41 @@ class PostgresAdapter:
                 ]
         return await self._retry(_fetch)
 
+    async def get_floor_maps(self, building_id: str) -> List[dict]:
+        """
+        Fetch all floor merged DB paths for a building.
+
+        Joins floors + merged_scans to find localization-ready DBs.
+
+        Returns:
+            List of dicts with floor_id, floor_name, level, file_path
+            sorted by level ASC. Empty list if none found.
+        """
+        async def _fetch():
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT f.id AS floor_id, f.name AS floor_name, f.level,
+                           ms.file_path
+                    FROM floors f
+                    JOIN merged_scans ms ON ms.floor_id = f.id
+                    WHERE f.building_id = $1
+                      AND ms.file_path IS NOT NULL
+                    ORDER BY f.level ASC
+                    """,
+                    uuid.UUID(building_id)
+                )
+                return [
+                    {
+                        "floor_id": str(r["floor_id"]),
+                        "floor_name": r["floor_name"],
+                        "level": r["level"],
+                        "file_path": r["file_path"],
+                    }
+                    for r in rows
+                ]
+        return await self._retry(_fetch)
+
     async def get_preview_image_path(self, building_id: str) -> Optional[str]:
         """Get latest available preview image path for a building's completed scan session."""
         async def _fetch():

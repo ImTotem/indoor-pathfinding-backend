@@ -38,6 +38,8 @@ class SLAMLocalizeResponse(BaseModel):
     mapId: str = ""
     numMatches: int = 0
     matchedImageIndex: int = 0
+    floorId: str = ""
+    floorLevel: int = 0
 
 
 class MapMetadata(BaseModel):

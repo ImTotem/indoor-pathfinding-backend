@@ -253,7 +253,7 @@ def _create_detector(strategy: int, max_features: int = 1000, brief_bytes: int =
         return det, det
 
 
-MAX_CACHED_MAPS = 3  # LRU limit — oldest-accessed map evicted when exceeded
+MAX_CACHED_MAPS = 10  # LRU limit — supports multi-floor buildings
 
 
 class MapManager:
@@ -275,17 +275,23 @@ class MapManager:
                     cls._instance = inst
         return cls._instance
 
-    def get_or_load(self, map_id: str) -> LoadedMap:
-        """Return cached map or load from disk."""
+    def get_or_load(self, map_id: str, db_path: Optional[str] = None) -> LoadedMap:
+        """Return cached map or load from disk.
+
+        Args:
+            map_id: Unique identifier used as cache key.
+            db_path: Explicit path to DB file. If None, looks in MAPS_DIR.
+        """
         if map_id in self._maps:
             self._maps.move_to_end(map_id)
             return self._maps[map_id]
 
-        db_path = settings.MAPS_DIR / f"{map_id}.db"
-        if not db_path.exists():
-            raise FileNotFoundError(f"Map not found: {map_id}")
+        from pathlib import Path
+        resolved = Path(db_path) if db_path else settings.MAPS_DIR / f"{map_id}.db"
+        if not resolved.exists():
+            raise FileNotFoundError(f"Map not found: {resolved}")
 
-        self._maps[map_id] = LoadedMap(map_id, str(db_path))
+        self._maps[map_id] = LoadedMap(map_id, str(resolved))
         while len(self._maps) > MAX_CACHED_MAPS:
             evicted_id, _ = self._maps.popitem(last=False)
             logger.info(f"Map '{evicted_id}' evicted (LRU, max={MAX_CACHED_MAPS})")
@@ -301,7 +307,8 @@ class MapManager:
         logger.info("All maps unloaded")
 
     def localize(
-        self, map_id: str, images: List[bytes], intrinsics: Optional[dict] = None
+        self, map_id: str, images: List[bytes], intrinsics: Optional[dict] = None,
+        db_path: Optional[str] = None,
     ) -> dict:
         """Localize query images against a loaded map using PnP.
 
@@ -311,7 +318,7 @@ class MapManager:
         4. Solve PnP with RANSAC to compute precise 6DoF camera pose
         5. Return the result with the most inliers across all query images
         """
-        loaded = self.get_or_load(map_id)
+        loaded = self.get_or_load(map_id, db_path=db_path)
 
         if loaded.all_descriptors is None:
             raise ValueError(
