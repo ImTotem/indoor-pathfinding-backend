@@ -1,5 +1,6 @@
 import threading
 import logging
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -90,3 +91,27 @@ class PersonMasker:
         except Exception as e:
             logger.warning(f"[PersonMasker] Masking failed: {e}")
             return grayscale
+
+    def detect_boxes(self, img_bytes: bytes) -> List[Tuple[int, int, int, int]]:
+        """Return person bounding boxes as list of (x1, y1, x2, y2).
+
+        Used by the debug endpoint to draw annotations without modifying images.
+        Returns empty list if YOLO is unavailable or detection fails.
+        """
+        if not self._load_model():
+            return []
+        try:
+            bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None:
+                return []
+            results = self._model(bgr, classes=[_PERSON_CLASS], verbose=False)
+            boxes = []
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes.xyxy.cpu().numpy():
+                    boxes.append((int(box[0]), int(box[1]), int(box[2]), int(box[3])))
+            return boxes
+        except Exception as e:
+            logger.warning(f"[PersonMasker] detect_boxes failed: {e}")
+            return []

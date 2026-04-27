@@ -1,5 +1,9 @@
 import base64
 import io
+import functools
+import asyncio
+import cv2
+import numpy as np
 from fastapi import APIRouter, HTTPException, status
 from PIL import Image
 
@@ -9,7 +13,10 @@ from models.slam_api import (
     SLAMLocalizeRequest,
     SLAMLocalizeResponse,
     MapMetadata,
-    HealthResponse
+    HealthResponse,
+    MaskDebugRequest,
+    MaskDebugResponse,
+    MaskDebugImage,
 )
 from slam_interface.factory import SLAMEngineFactory
 from config.settings import Settings
@@ -275,3 +282,51 @@ async def localize_in_map(request: SLAMLocalizeRequest):
 async def localize_in_map_v2(request: SLAMLocalizeRequest):
     """Localize with YOLO-based person masking for improved accuracy in crowded spaces."""
     return await _localize_impl(request, mask_persons=True)
+
+
+@router.post("/v2/debug/mask", response_model=MaskDebugResponse, status_code=status.HTTP_200_OK)
+async def debug_person_mask(request: MaskDebugRequest):
+    """Return original images and YOLO-annotated versions for debugging person masking.
+
+    For each input image, returns:
+    - original_b64: the original image re-encoded as JPEG
+    - annotated_b64: same image with green bounding boxes drawn around detected persons
+    - persons_detected: number of persons found
+
+    Intended for before/after comparison and PPT slides.
+    """
+    from slam_engines.rtabmap.person_masker import PersonMasker
+
+    masker = PersonMasker()
+    loop = asyncio.get_event_loop()
+    results = []
+
+    for i, img_b64 in enumerate(request.images):
+        try:
+            img_bytes = base64.b64decode(img_b64)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 in image {i + 1}")
+
+        bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise HTTPException(status_code=400, detail=f"Cannot decode image {i + 1}")
+
+        boxes = await loop.run_in_executor(None, functools.partial(masker.detect_boxes, img_bytes))
+
+        annotated = bgr.copy()
+        for (x1, y1, x2, y2) in boxes:
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            cv2.putText(annotated, "person", (x1, max(y1 - 8, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        _, orig_buf = cv2.imencode(".jpg", bgr)
+        _, ann_buf = cv2.imencode(".jpg", annotated)
+
+        results.append(MaskDebugImage(
+            index=i,
+            original_b64=base64.b64encode(orig_buf.tobytes()).decode(),
+            annotated_b64=base64.b64encode(ann_buf.tobytes()).decode(),
+            persons_detected=len(boxes),
+        ))
+
+    return MaskDebugResponse(total_images=len(results), results=results)

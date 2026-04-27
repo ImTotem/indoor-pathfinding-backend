@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import List
+from typing import List, Optional
 
 
 class SLAMProcessRequest(BaseModel):
@@ -54,3 +54,28 @@ class HealthResponse(BaseModel):
     status: str
     postgres: str
     queue_length: int
+
+
+class MaskDebugRequest(BaseModel):
+    images: List[str] = Field(..., json_schema_extra={"example": ["base64_img1"]})
+
+    @field_validator('images')
+    @classmethod
+    def validate_images(cls, v: list) -> list:
+        if len(v) < 1:
+            raise ValueError('Must provide at least 1 image')
+        if len(v) > 5:
+            raise ValueError('Maximum 5 images allowed')
+        return v
+
+
+class MaskDebugImage(BaseModel):
+    index: int
+    original_b64: str
+    annotated_b64: str
+    persons_detected: int
+
+
+class MaskDebugResponse(BaseModel):
+    total_images: int
+    results: List[MaskDebugImage]
