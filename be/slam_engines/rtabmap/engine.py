@@ -654,7 +654,7 @@ class RTABMapEngine(SLAMEngineBase):
         print(f"[RTAB-Map] Database loaded: {len(data)} bytes")
         return data
     
-    async def localize(self, map_id: str, images: List[bytes], intrinsics: Optional[Dict] = None, initial_pose: Optional[Dict] = None, db_path: Optional[str] = None) -> dict:
+    async def localize(self, map_id: str, images: List[bytes], intrinsics: Optional[Dict] = None, initial_pose: Optional[Dict] = None, db_path: Optional[str] = None, mask_persons: bool = False) -> dict:
         """Localize current position using query images against a map.
 
         Uses in-memory map matching via MapManager for fast relocalization.
@@ -677,7 +677,7 @@ class RTABMapEngine(SLAMEngineBase):
         mgr = MapManager()
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, functools.partial(mgr.localize, map_id, images, intrinsics, db_path=db_path)
+            None, functools.partial(mgr.localize, map_id, images, intrinsics, db_path=db_path, mask_persons=mask_persons)
         )
         return result
     

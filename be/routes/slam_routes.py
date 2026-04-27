@@ -160,16 +160,12 @@ async def get_map_metadata(building_id: str):
     )
 
 
-@router.post("/localize", response_model=SLAMLocalizeResponse, status_code=status.HTTP_200_OK)
-async def localize_in_map(request: SLAMLocalizeRequest):
-    """Localize against all floors of a building in parallel.
+async def _localize_impl(request: SLAMLocalizeRequest, mask_persons: bool = False) -> SLAMLocalizeResponse:
+    """Core localization logic shared by v1 and v2 endpoints."""
+    import asyncio
 
-    map_id is treated as building_id. The endpoint discovers all floor
-    merged DBs and searches them concurrently, returning the result
-    with the highest confidence (ties broken by num_matches).
-    """
     building_id = request.map_id
-    logger.info(f"[SLAM-LOCALIZE] building_id: {building_id}")
+    logger.info(f"[SLAM-LOCALIZE] building_id: {building_id}, mask_persons: {mask_persons}")
 
     # --- decode images ---
     try:
@@ -188,7 +184,6 @@ async def localize_in_map(request: SLAMLocalizeRequest):
         floor_maps = await postgres_adapter.get_floor_maps(building_id)
 
     if not floor_maps:
-        # Fallback: single DB in MAPS_DIR (backward compatibility)
         single_db = settings.MAPS_DIR / f"{building_id}.db"
         if single_db.exists():
             floor_maps = [{"floor_id": "", "floor_name": "", "level": 0, "file_path": str(single_db)}]
@@ -228,13 +223,12 @@ async def localize_in_map(request: SLAMLocalizeRequest):
         intrinsics = slam_engine.scale_intrinsics(intrinsics, img_width, img_height)
 
     # --- localize against all floors in parallel ---
-    import asyncio
-
     async def _localize_floor(fm: dict) -> dict:
         try:
             result = await slam_engine.localize(
                 fm["floor_id"], image_bytes_list,
                 intrinsics=intrinsics, db_path=fm["file_path"],
+                mask_persons=mask_persons,
             )
             result["floor_id"] = fm["floor_id"]
             result["floor_name"] = fm["floor_name"]
@@ -253,7 +247,6 @@ async def localize_in_map(request: SLAMLocalizeRequest):
     if not valid:
         raise HTTPException(status_code=503, detail="Localization failed on all floors")
 
-    # Best = highest confidence, tiebreak by num_matches
     best = max(valid, key=lambda r: (r["confidence"], r.get("num_matches", 0)))
 
     logger.info(
@@ -270,3 +263,15 @@ async def localize_in_map(request: SLAMLocalizeRequest):
         floorId=best.get("floor_id", ""),
         floorLevel=best.get("floor_level", 0),
     )
+
+
+@router.post("/localize", response_model=SLAMLocalizeResponse, status_code=status.HTTP_200_OK)
+async def localize_in_map(request: SLAMLocalizeRequest):
+    """Localize against all floors of a building in parallel."""
+    return await _localize_impl(request, mask_persons=False)
+
+
+@router.post("/v2/localize", response_model=SLAMLocalizeResponse, status_code=status.HTTP_200_OK)
+async def localize_in_map_v2(request: SLAMLocalizeRequest):
+    """Localize with YOLO-based person masking for improved accuracy in crowded spaces."""
+    return await _localize_impl(request, mask_persons=True)

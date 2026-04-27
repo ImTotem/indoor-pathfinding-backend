@@ -308,7 +308,7 @@ class MapManager:
 
     def localize(
         self, map_id: str, images: List[bytes], intrinsics: Optional[dict] = None,
-        db_path: Optional[str] = None,
+        db_path: Optional[str] = None, mask_persons: bool = False,
     ) -> dict:
         """Localize query images against a loaded map using PnP.
 
@@ -349,6 +349,10 @@ class MapManager:
             img = _decode_image_with_exif(img_bytes)
             if img is None:
                 continue
+
+            if mask_persons:
+                from .person_masker import PersonMasker
+                img = PersonMasker().mask(img_bytes, img)
 
             kps = detector.detect(img)
             kps, q_descs = desc_extractor.compute(img, kps)
