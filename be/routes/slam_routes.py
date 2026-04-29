@@ -17,6 +17,7 @@ from models.slam_api import (
     MaskDebugRequest,
     MaskDebugResponse,
     MaskDebugImage,
+    MatchDebugResponse,
 )
 from slam_interface.factory import SLAMEngineFactory
 from config.settings import Settings
@@ -335,3 +336,96 @@ async def debug_person_mask(request: MaskDebugRequest):
         ))
 
     return MaskDebugResponse(total_images=len(results), results=results)
+
+
+@router.post("/v2/debug/matches", response_model=MatchDebugResponse, status_code=status.HTTP_200_OK)
+async def debug_matches(request: SLAMLocalizeRequest):
+    """Visualize feature matches between the query image and the best-matched DB keyframe.
+
+    Returns:
+    - query_b64: query image with detected keypoints
+    - db_frame_b64: matched DB keyframe image (if stored in DB)
+    - matches_b64: side-by-side image with match lines
+    """
+    from slam_engines.rtabmap.match_debugger import visualize_matches
+
+    building_id = request.map_id
+
+    try:
+        img_bytes = base64.b64decode(request.images[0])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
+
+    # --- discover floor maps (same as _localize_impl) ---
+    floor_maps = []
+    if postgres_adapter is not None:
+        floor_maps = await postgres_adapter.get_floor_maps(building_id)
+    if not floor_maps:
+        single_db = settings.MAPS_DIR / f"{building_id}.db"
+        if single_db.exists():
+            floor_maps = [{"floor_id": "", "floor_name": "", "level": 0, "file_path": str(single_db)}]
+        else:
+            raise HTTPException(status_code=404, detail=f"No maps found for building {building_id}")
+
+    # --- resolve DB paths ---
+    slam_engine = SLAMEngineFactory.create(settings.SLAM_ENGINE_TYPE)
+    resolved_floors = []
+    for fm in floor_maps:
+        fp = fm["file_path"]
+        if fp.startswith("./storage/uploads/") or fp.startswith("storage/uploads/"):
+            fp = f"/app/storage/uploads/{fp.split('/')[-1]}"
+        resolved_floors.append({**fm, "file_path": fp})
+
+    # --- resize query image to DB resolution ---
+    intrinsics = None
+    for fm in resolved_floors:
+        try:
+            intrinsics = slam_engine.extract_intrinsics_from_db(fm["file_path"])
+            break
+        except Exception:
+            continue
+    if intrinsics is None:
+        raise HTTPException(status_code=500, detail="Failed to extract intrinsics")
+
+    db_w, db_h = intrinsics["width"], intrinsics["height"]
+    pil_img = Image.open(io.BytesIO(img_bytes))
+    if pil_img.size != (db_w, db_h):
+        pil_img = pil_img.resize((db_w, db_h), Image.LANCZOS)
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=95)
+    img_bytes = buf.getvalue()
+
+    # --- run visualize_matches on each floor, keep best ---
+    best_result = None
+    best_floor = None
+    for fm in resolved_floors:
+        map_id_key = fm["floor_id"] or building_id
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                functools.partial(visualize_matches, fm["file_path"], map_id_key, img_bytes),
+            )
+            if best_result is None or result["num_node_matches"] > best_result["num_node_matches"]:
+                best_result = result
+                best_floor = fm
+        except Exception as e:
+            logger.debug(f"[DEBUG-MATCHES] Floor {fm.get('floor_name', '')}: {e}")
+
+    if best_result is None:
+        raise HTTPException(status_code=503, detail="No matches found on any floor")
+
+    def _enc(bgr: np.ndarray) -> str:
+        _, buf = cv2.imencode(".jpg", bgr)
+        return base64.b64encode(buf.tobytes()).decode()
+
+    return MatchDebugResponse(
+        query_b64=_enc(best_result["query_bgr"]),
+        matches_b64=_enc(best_result["vis_bgr"]),
+        db_frame_b64=_enc(best_result["db_bgr"]) if best_result["has_db_image"] else None,
+        best_node_id=best_result["best_node_id"],
+        num_good_matches=best_result["num_good_matches"],
+        num_node_matches=best_result["num_node_matches"],
+        floor_id=best_floor.get("floor_id", ""),
+        floor_name=best_floor.get("floor_name", ""),
+        has_db_image=best_result["has_db_image"],
+    )

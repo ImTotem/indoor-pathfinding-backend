@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 class SLAMProcessRequest(BaseModel):
@@ -79,3 +79,15 @@ class MaskDebugImage(BaseModel):
 class MaskDebugResponse(BaseModel):
     total_images: int
     results: List[MaskDebugImage]
+
+
+class MatchDebugResponse(BaseModel):
+    query_b64: str
+    matches_b64: str
+    db_frame_b64: Optional[str] = None
+    best_node_id: int
+    num_good_matches: int
+    num_node_matches: int
+    floor_id: str = ""
+    floor_name: str = ""
+    has_db_image: bool
