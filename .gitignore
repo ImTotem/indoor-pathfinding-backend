@@ -414,3 +414,4 @@ indoor-pathfinding-backend/
 *.db
 2공*/
 test/
+!test/test_localize.py
