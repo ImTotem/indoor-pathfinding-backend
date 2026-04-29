@@ -47,9 +47,12 @@ def visualize_matches_sp(
 
     q_feats = engine._extract(gray)
     q_kps = q_feats['keypoints'][0].cpu().numpy()   # (N, 2)
-    q_desc_mean = q_feats['descriptors'][0].cpu().mean(0)  # (256,)
 
-    candidates = loaded.top_k_candidates(q_desc_mean)
+    from .global_descriptor import GlobalDescExtractor
+    gray_uint8 = (gray * 255).clip(0, 255).astype(np.uint8)
+    q_global = GlobalDescExtractor(engine._device).extract(gray_uint8)  # (384,)
+
+    candidates = loaded.top_k_candidates(q_global)
 
     best_node_id = None
     best_matches = None

@@ -150,6 +150,8 @@ class SuperPointLoadedMap:
             world_feats = _load_world_features(conn, transforms)
 
             global_descs: List[torch.Tensor] = []
+            from .global_descriptor import GlobalDescExtractor
+            global_desc_ext = GlobalDescExtractor(self.device)
 
             for node_id in all_ids:
                 img = _load_gray_float(conn, node_id)
@@ -164,8 +166,9 @@ class SuperPointLoadedMap:
                 self.keyframe_feats[node_id] = cpu
                 self.node_ids.append(node_id)
 
-                descs = cpu['descriptors'][0]          # (N, 256)
-                global_descs.append(descs.mean(dim=0)) # (256,)
+                # DINOv2 global descriptor (384-dim) instead of mean SuperPoint (256-dim)
+                img_uint8 = (img * 255).clip(0, 255).astype(np.uint8)
+                global_descs.append(global_desc_ext.extract(img_uint8))  # (384,)
 
                 sp_kps = cpu['keypoints'][0].numpy()   # (N, 2)
                 if node_id in world_feats:
@@ -185,7 +188,7 @@ class SuperPointLoadedMap:
             conn.close()
 
         if global_descs:
-            self.global_descs = torch.stack(global_descs)   # (K, 256)
+            self.global_descs = torch.stack(global_descs)   # (K, 384)
 
         n_with_3d = sum(
             1 for v in self.keyframe_world3d.values()
