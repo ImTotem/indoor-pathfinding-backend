@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.13-slim
+FROM python:3.11-slim
 
 # System dependencies
 RUN apt-get update && apt-get install -y \
@@ -21,7 +21,8 @@ COPY requirements.txt .
 
 # Install Python dependencies (BuildKit cache keeps downloads across builds)
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system -r requirements.txt
+    uv pip install --system -r requirements.txt && \
+    uv pip install --system --reinstall opencv-contrib-python
 
 # Copy application code
 COPY . .

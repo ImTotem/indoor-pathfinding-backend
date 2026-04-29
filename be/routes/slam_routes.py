@@ -220,14 +220,20 @@ async def _localize_impl(request: SLAMLocalizeRequest, mask_persons: bool = Fals
     if intrinsics is None:
         raise HTTPException(status_code=500, detail="Failed to extract intrinsics from any floor DB")
 
-    try:
-        img = Image.open(io.BytesIO(image_bytes_list[0]))
-        img_width, img_height = img.size
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image data: {e}")
-
-    if (img_width, img_height) != (intrinsics['width'], intrinsics['height']):
-        intrinsics = slam_engine.scale_intrinsics(intrinsics, img_width, img_height)
+    # Resize query images to DB resolution for feature matching at the correct scale
+    db_w, db_h = intrinsics['width'], intrinsics['height']
+    resized = []
+    for img_bytes in image_bytes_list:
+        try:
+            img = Image.open(io.BytesIO(img_bytes))
+            if img.size != (db_w, db_h):
+                img = img.resize((db_w, db_h), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=95)
+            resized.append(buf.getvalue())
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid image data: {e}")
+    image_bytes_list = resized
 
     # --- localize against all floors in parallel ---
     async def _localize_floor(fm: dict) -> dict:
