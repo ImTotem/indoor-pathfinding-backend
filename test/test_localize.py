@@ -117,7 +117,10 @@ def run_localize(base_url: str, map_id: str, images_b64: list, tag: str, version
     path = {"v1": "localize", "v2": "v2/localize", "v3": "v3/localize"}[version]
     endpoint = f"{base_url}/{path}"
     label = f"{version}_localize"
-    print(f"\n[{label}] Sending {len(images_b64)} image(s)...")
+    # v3 builds a SuperPoint index on first run (CPU: ~5 min for 439 frames)
+    timeout = 600 if version == "v3" else 120
+    print(f"\n[{label}] Sending {len(images_b64)} image(s)..."
+          + (" (first run may take several minutes for indexing)" if version == "v3" else ""))
 
     resp = requests.post(
         endpoint,
@@ -126,7 +129,7 @@ def run_localize(base_url: str, map_id: str, images_b64: list, tag: str, version
             "images": images_b64,
             "camera_intrinsics": DUMMY_INTRINSICS,
         },
-        timeout=120,
+        timeout=timeout,
     )
 
     out_dir = RESPONSE_DIR / tag / label
