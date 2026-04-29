@@ -413,3 +413,4 @@ indoor-pathfinding-backend/
 *.mp4
 *.db
 2공*/
+test/
