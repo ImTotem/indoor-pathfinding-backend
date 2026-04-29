@@ -323,7 +323,6 @@ async def debug_person_mask(request: MaskDebugRequest):
         annotated = bgr.copy()
         for (x1, y1, x2, y2) in boxes:
             annotated[y1:y2, x1:x2] = 0
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
         _, orig_buf = cv2.imencode(".jpg", bgr)
         _, ann_buf = cv2.imencode(".jpg", annotated)
