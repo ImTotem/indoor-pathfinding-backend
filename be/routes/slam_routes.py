@@ -319,11 +319,11 @@ async def debug_person_mask(request: MaskDebugRequest):
 
         boxes = await loop.run_in_executor(None, functools.partial(masker.detect_boxes, img_bytes))
 
+        # annotated: person regions blacked out (mirrors what localize actually does)
         annotated = bgr.copy()
         for (x1, y1, x2, y2) in boxes:
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
-            cv2.putText(annotated, "person", (x1, max(y1 - 8, 0)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            annotated[y1:y2, x1:x2] = 0
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
         _, orig_buf = cv2.imencode(".jpg", bgr)
         _, ann_buf = cv2.imencode(".jpg", annotated)
