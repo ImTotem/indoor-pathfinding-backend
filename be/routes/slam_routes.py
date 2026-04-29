@@ -168,7 +168,7 @@ async def get_map_metadata(building_id: str):
     )
 
 
-async def _localize_impl(request: SLAMLocalizeRequest, mask_persons: bool = False) -> SLAMLocalizeResponse:
+async def _localize_impl(request: SLAMLocalizeRequest, mask_persons: bool = False, engine=None) -> SLAMLocalizeResponse:
     """Core localization logic shared by v1 and v2 endpoints."""
     import asyncio
 
@@ -199,7 +199,7 @@ async def _localize_impl(request: SLAMLocalizeRequest, mask_persons: bool = Fals
             raise HTTPException(status_code=404, detail=f"No maps found for building {building_id}")
 
     # --- resolve DB paths ---
-    slam_engine = SLAMEngineFactory.create(settings.SLAM_ENGINE_TYPE)
+    slam_engine = engine or SLAMEngineFactory.create(settings.SLAM_ENGINE_TYPE)
 
     resolved_floors = []
     for fm in floor_maps:
@@ -289,6 +289,29 @@ async def localize_in_map(request: SLAMLocalizeRequest):
 async def localize_in_map_v2(request: SLAMLocalizeRequest):
     """Localize with YOLO-based person masking for improved accuracy in crowded spaces."""
     return await _localize_impl(request, mask_persons=True)
+
+
+# --- SuperPoint + LightGlue engine singleton ---
+import threading as _threading
+
+_sp_engine = None
+_sp_engine_lock = _threading.Lock()
+
+
+def _get_sp_engine():
+    global _sp_engine
+    if _sp_engine is None:
+        with _sp_engine_lock:
+            if _sp_engine is None:
+                from slam_engines.superpoint.engine import SuperPointEngine
+                _sp_engine = SuperPointEngine()
+    return _sp_engine
+
+
+@router.post("/v3/localize", response_model=SLAMLocalizeResponse, status_code=status.HTTP_200_OK)
+async def localize_in_map_v3(request: SLAMLocalizeRequest):
+    """Localize using SuperPoint + LightGlue for higher accuracy in challenging environments."""
+    return await _localize_impl(request, mask_persons=False, engine=_get_sp_engine())
 
 
 @router.post("/v2/debug/mask", response_model=MaskDebugResponse, status_code=status.HTTP_200_OK)

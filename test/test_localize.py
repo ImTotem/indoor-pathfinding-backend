@@ -113,9 +113,10 @@ def run_match_debug(base_url: str, map_id: str, images_b64: list, tag: str):
     print(f"[match-debug] Saved to {out_dir}")
 
 
-def run_localize(base_url: str, map_id: str, images_b64: list, tag: str, v2: bool):
-    endpoint = f"{base_url}/v2/localize" if v2 else f"{base_url}/localize"
-    label = "v2_localize" if v2 else "v1_localize"
+def run_localize(base_url: str, map_id: str, images_b64: list, tag: str, version: str = "v1"):
+    path = {"v1": "localize", "v2": "v2/localize", "v3": "v3/localize"}[version]
+    endpoint = f"{base_url}/{path}"
+    label = f"{version}_localize"
     print(f"\n[{label}] Sending {len(images_b64)} image(s)...")
 
     resp = requests.post(
@@ -183,8 +184,9 @@ def main():
         run_mask_debug(base_url, images_b64, tag)
         run_match_debug(base_url, args.map_id, images_b64, tag)
 
-    run_localize(base_url, args.map_id, images_b64, tag, v2=False)
-    run_localize(base_url, args.map_id, images_b64, tag, v2=True)
+    run_localize(base_url, args.map_id, images_b64, tag, version="v1")
+    run_localize(base_url, args.map_id, images_b64, tag, version="v2")
+    run_localize(base_url, args.map_id, images_b64, tag, version="v3")
 
     print(f"\nAll outputs saved under: {RESPONSE_DIR / tag}")
 
