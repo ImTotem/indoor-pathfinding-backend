@@ -361,17 +361,12 @@ async def debug_person_mask(request: MaskDebugRequest):
     return MaskDebugResponse(total_images=len(results), results=results)
 
 
-@router.post("/v2/debug/matches", response_model=MatchDebugResponse, status_code=status.HTTP_200_OK)
-async def debug_matches(request: SLAMLocalizeRequest):
-    """Visualize feature matches between the query image and the best-matched DB keyframe.
-
-    Returns:
-    - query_b64: query image with detected keypoints
-    - db_frame_b64: matched DB keyframe image (if stored in DB)
-    - matches_b64: side-by-side image with match lines
-    """
-    from slam_engines.rtabmap.match_debugger import visualize_matches
-
+async def _debug_matches_impl(
+    request: SLAMLocalizeRequest,
+    mask_persons: bool = False,
+    use_sp: bool = False,
+) -> MatchDebugResponse:
+    """Shared logic for v1/v2/v3 debug/matches endpoints."""
     building_id = request.map_id
 
     try:
@@ -379,7 +374,6 @@ async def debug_matches(request: SLAMLocalizeRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
 
-    # --- discover floor maps (same as _localize_impl) ---
     floor_maps = []
     if postgres_adapter is not None:
         floor_maps = await postgres_adapter.get_floor_maps(building_id)
@@ -390,7 +384,6 @@ async def debug_matches(request: SLAMLocalizeRequest):
         else:
             raise HTTPException(status_code=404, detail=f"No maps found for building {building_id}")
 
-    # --- resolve DB paths ---
     slam_engine = SLAMEngineFactory.create(settings.SLAM_ENGINE_TYPE)
     resolved_floors = []
     for fm in floor_maps:
@@ -399,7 +392,6 @@ async def debug_matches(request: SLAMLocalizeRequest):
             fp = f"/app/storage/uploads/{fp.split('/')[-1]}"
         resolved_floors.append({**fm, "file_path": fp})
 
-    # --- resize query image to DB resolution ---
     intrinsics = None
     for fm in resolved_floors:
         try:
@@ -418,21 +410,44 @@ async def debug_matches(request: SLAMLocalizeRequest):
     pil_img.save(buf, format="JPEG", quality=95)
     img_bytes = buf.getvalue()
 
-    # --- run visualize_matches on each floor, keep best ---
     best_result = None
     best_floor = None
-    for fm in resolved_floors:
-        map_id_key = fm["floor_id"] or building_id
-        try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                functools.partial(visualize_matches, fm["file_path"], map_id_key, img_bytes),
-            )
-            if best_result is None or result["num_node_matches"] > best_result["num_node_matches"]:
-                best_result = result
-                best_floor = fm
-        except Exception as e:
-            logger.debug(f"[DEBUG-MATCHES] Floor {fm.get('floor_name', '')}: {e}")
+
+    if use_sp:
+        from slam_engines.superpoint.match_debugger import visualize_matches_sp
+        sp_engine = _get_sp_engine()
+        for fm in resolved_floors:
+            map_id_key = fm["floor_id"] or building_id
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    functools.partial(
+                        visualize_matches_sp,
+                        fm["file_path"], map_id_key, img_bytes, sp_engine,
+                    ),
+                )
+                if best_result is None or result["num_node_matches"] > best_result["num_node_matches"]:
+                    best_result = result
+                    best_floor = fm
+            except Exception as e:
+                logger.debug(f"[DEBUG-MATCHES-V3] Floor {fm.get('floor_name', '')}: {e}")
+    else:
+        from slam_engines.rtabmap.match_debugger import visualize_matches
+        for fm in resolved_floors:
+            map_id_key = fm["floor_id"] or building_id
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    functools.partial(
+                        visualize_matches,
+                        fm["file_path"], map_id_key, img_bytes, 50, mask_persons,
+                    ),
+                )
+                if best_result is None or result["num_node_matches"] > best_result["num_node_matches"]:
+                    best_result = result
+                    best_floor = fm
+            except Exception as e:
+                logger.debug(f"[DEBUG-MATCHES] Floor {fm.get('floor_name', '')}: {e}")
 
     if best_result is None:
         raise HTTPException(status_code=503, detail="No matches found on any floor")
@@ -452,3 +467,21 @@ async def debug_matches(request: SLAMLocalizeRequest):
         floor_name=best_floor.get("floor_name", ""),
         has_db_image=best_result["has_db_image"],
     )
+
+
+@router.post("/v1/debug/matches", response_model=MatchDebugResponse, status_code=status.HTTP_200_OK)
+async def debug_matches_v1(request: SLAMLocalizeRequest):
+    """RTABMap GFTT+BRIEF match visualization without person masking."""
+    return await _debug_matches_impl(request, mask_persons=False, use_sp=False)
+
+
+@router.post("/v2/debug/matches", response_model=MatchDebugResponse, status_code=status.HTTP_200_OK)
+async def debug_matches_v2(request: SLAMLocalizeRequest):
+    """RTABMap GFTT+BRIEF match visualization with YOLO person masking applied."""
+    return await _debug_matches_impl(request, mask_persons=True, use_sp=False)
+
+
+@router.post("/v3/debug/matches", response_model=MatchDebugResponse, status_code=status.HTTP_200_OK)
+async def debug_matches_v3(request: SLAMLocalizeRequest):
+    """SuperPoint+LightGlue match visualization."""
+    return await _debug_matches_impl(request, mask_persons=False, use_sp=True)

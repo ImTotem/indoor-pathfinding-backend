@@ -78,23 +78,32 @@ def run_mask_debug(base_url: str, images_b64: list, tag: str):
     print(f"[mask-debug] Saved to {out_dir}")
 
 
-def run_match_debug(base_url: str, map_id: str, images_b64: list, tag: str):
-    print(f"\n[match-debug] Sending first image for match visualization...")
+def run_match_debug(base_url: str, map_id: str, images_b64: list, tag: str, version: str = "v1"):
+    endpoint_map = {
+        "v1": "v1/debug/matches",
+        "v2": "v2/debug/matches",
+        "v3": "v3/debug/matches",
+    }
+    path = endpoint_map[version]
+    label = f"{version}_match_debug"
+    timeout = 600 if version == "v3" else 120
+    print(f"\n[{label}] Sending first image for match visualization..."
+          + (" (may take several minutes for first-run indexing)" if version == "v3" else ""))
     resp = requests.post(
-        f"{base_url}/v2/debug/matches",
+        f"{base_url}/{path}",
         json={
             "map_id": map_id,
             "images": images_b64[:1],
             "camera_intrinsics": DUMMY_INTRINSICS,
         },
-        timeout=120,
+        timeout=timeout,
     )
     if resp.status_code != 200:
-        print(f"[match-debug] ERROR {resp.status_code}: {_safe_error(resp.text)}")
+        print(f"[{label}] ERROR {resp.status_code}: {_safe_error(resp.text)}")
         return
 
     data = resp.json()
-    out_dir = RESPONSE_DIR / tag / "match_debug"
+    out_dir = RESPONSE_DIR / tag / label
     out_dir.mkdir(parents=True, exist_ok=True)
 
     save_image_b64(data["query_b64"], out_dir / "query_keypoints.jpg")
@@ -110,7 +119,7 @@ def run_match_debug(base_url: str, map_id: str, images_b64: list, tag: str):
     print(f"  num_node_matches: {data.get('num_node_matches')}")
     print(f"  floor_name      : {data.get('floor_name')}")
     print(f"  has_db_image    : {data.get('has_db_image')}")
-    print(f"[match-debug] Saved to {out_dir}")
+    print(f"[{label}] Saved to {out_dir}")
 
 
 def run_localize(base_url: str, map_id: str, images_b64: list, tag: str, version: str = "v1"):
@@ -185,7 +194,9 @@ def main():
 
     if args.debug:
         run_mask_debug(base_url, images_b64, tag)
-        run_match_debug(base_url, args.map_id, images_b64, tag)
+        run_match_debug(base_url, args.map_id, images_b64, tag, version="v1")
+        run_match_debug(base_url, args.map_id, images_b64, tag, version="v2")
+        run_match_debug(base_url, args.map_id, images_b64, tag, version="v3")
 
     run_localize(base_url, args.map_id, images_b64, tag, version="v1")
     run_localize(base_url, args.map_id, images_b64, tag, version="v2")

@@ -30,6 +30,7 @@ def visualize_matches(
     map_id: str,
     img_bytes: bytes,
     max_draw: int = 50,
+    mask_persons: bool = False,
 ) -> dict:
     """
     Extract features from a query image, match against the loaded map,
@@ -62,6 +63,12 @@ def visualize_matches(
     gray = _decode_image_with_exif(img_bytes)
     if gray is None:
         raise ValueError("Cannot decode query image")
+
+    if mask_persons:
+        from slam_engines.rtabmap.person_masker import PersonMasker
+        boxes = PersonMasker().detect_boxes(img_bytes)
+        for (x1, y1, x2, y2) in boxes:
+            gray[y1:y2, x1:x2] = 0
 
     det, desc_ext = _create_detector(
         loaded.detector_strategy, loaded.max_features, loaded.brief_bytes
