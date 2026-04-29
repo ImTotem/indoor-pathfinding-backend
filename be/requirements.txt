@@ -12,4 +12,4 @@ asyncpg
 --extra-index-url https://download.pytorch.org/whl/cu126
 torch
 ultralytics
-lightglue
+lightglue @ git+https://github.com/cvg/LightGlue.git
