@@ -5,7 +5,7 @@ import asyncio
 import cv2
 import numpy as np
 from fastapi import APIRouter, HTTPException, status
-from PIL import Image
+from PIL import Image, ImageOps
 
 from models.slam_api import (
     SLAMProcessRequest,
@@ -226,7 +226,7 @@ async def _localize_impl(request: SLAMLocalizeRequest, mask_persons: bool = Fals
     resized = []
     for img_bytes in image_bytes_list:
         try:
-            img = Image.open(io.BytesIO(img_bytes))
+            img = ImageOps.exif_transpose(Image.open(io.BytesIO(img_bytes)))
             if img.size != (db_w, db_h):
                 img = img.resize((db_w, db_h), Image.LANCZOS)
             buf = io.BytesIO()
@@ -388,7 +388,7 @@ async def debug_matches(request: SLAMLocalizeRequest):
         raise HTTPException(status_code=500, detail="Failed to extract intrinsics")
 
     db_w, db_h = intrinsics["width"], intrinsics["height"]
-    pil_img = Image.open(io.BytesIO(img_bytes))
+    pil_img = ImageOps.exif_transpose(Image.open(io.BytesIO(img_bytes)))
     if pil_img.size != (db_w, db_h):
         pil_img = pil_img.resize((db_w, db_h), Image.LANCZOS)
     buf = io.BytesIO()
