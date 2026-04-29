@@ -3,7 +3,7 @@ FROM python:3.11-slim
 
 # System dependencies
 RUN apt-get update && apt-get install -y \
-    libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev curl \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev curl git \
     && rm -rf /var/lib/apt/lists/*
 
 # Docker CLI (needed to exec into rtabmap container)
