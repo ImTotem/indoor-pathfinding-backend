@@ -5,6 +5,9 @@ scan archive and routes it through `ScanIngestService` with auto enqueue.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import logging
 import shutil
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from indoor_server.application.api_v1.building_floor_service import BuildingFloorService
 from indoor_server.application.api_v1.errors import V1ServiceError
+from indoor_server.application.building.multiscan_rtabmap_merge import (
+    MultiScanReprocessParams,
+    MultiScanRtabmapMergeError,
+    MultiScanRtabmapReprocessRunner,
+    SourceRtabmapScan,
+)
 from indoor_server.application.scan_ingest_service import ScanIngestService
 from indoor_server.application.sidecar_parser import SidecarParser
 from indoor_server.application.zip_unpacker import ZipUnpacker
@@ -31,6 +40,8 @@ from indoor_server.interfaces.api.v1_schemas import (
     ProcessingStatusResponse,
     ScanChunkResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ScanCompatService:
@@ -112,22 +123,163 @@ class ScanCompatService:
         await self._session.commit()
 
     async def merge(self, floor_id: UUID, chunk_ids: list[UUID]) -> MergedScanResponse:
-        row = await self._select_chunk_for_merge(floor_id=floor_id, chunk_ids=chunk_ids)
+        sources = await self._collect_merge_sources(floor_id=floor_id, chunk_ids=chunk_ids)
+        if not sources:
+            raise V1ServiceError(404, "CHUNK_NOT_FOUND", "scan chunk not found")
+
+        # 단일 청크: 기존 active flag flip 만 (실 merge 불필요).
+        if len(sources) == 1:
+            row = sources[0]
+            await self._session.execute(
+                sa.update(t.floor_scan)
+                .where(t.floor_scan.c.floor_id == str(floor_id))
+                .values(active=False)
+            )
+            await self._session.execute(
+                sa.update(t.floor_scan)
+                .where(t.floor_scan.c.floor_scan_id == row.floor_scan_id)
+                .values(active=True, status="MERGED")
+            )
+            await self._session.commit()
+            return MergedScanResponse(
+                floor_id=floor_id,
+                active_scan_id=UUID(str(row.scan_id)),
+                status=await self._merge_status_for_scan(str(row.scan_id)),
+            )
+
+        # 다중 청크: rtabmap-reprocess 로 실 RTABMap multi-scan 통합.
+        return await self._real_multiscan_merge(floor_id=floor_id, sources=sources)
+
+    async def _collect_merge_sources(
+        self, *, floor_id: UUID, chunk_ids: list[UUID]
+    ) -> list[Any]:
+        filters = [t.floor_scan.c.floor_id == str(floor_id)]
+        if chunk_ids:
+            chunk_id_strs = [str(c) for c in chunk_ids]
+            filters.append(
+                sa.or_(
+                    t.floor_scan.c.floor_scan_id.in_(chunk_id_strs),
+                    t.floor_scan.c.scan_id.in_(chunk_id_strs),
+                )
+            )
+        stmt = (
+            sa.select(
+                t.floor_scan.c.floor_scan_id,
+                t.floor_scan.c.scan_id,
+                t.floor_scan.c.upload_order,
+                t.floor_scan.c.created_at,
+                t.scan_ingest.c.storage_path,
+            )
+            .join(t.scan_ingest, t.scan_ingest.c.scan_id == t.floor_scan.c.scan_id)
+            .where(*filters)
+            .order_by(
+                t.floor_scan.c.upload_order.asc(), t.floor_scan.c.created_at.asc()
+            )
+        )
+        return list((await self._session.execute(stmt)).fetchall())
+
+    async def _real_multiscan_merge(
+        self, *, floor_id: UUID, sources: list[Any]
+    ) -> MergedScanResponse:
+        runner = MultiScanRtabmapReprocessRunner()
+        if not runner.is_available():
+            raise V1ServiceError(
+                status_code=503,
+                code="RTABMAP_REPROCESS_UNAVAILABLE",
+                message="rtabmap-reprocess binary not available.",
+            )
+
+        merged_scan_id = uuid4()
+        storage_root = Path(settings.storage_root)
+        rel_storage_path = f"scans/{merged_scan_id}"
+        merged_dir = storage_root / rel_storage_path
+        merged_db_path = merged_dir / "rtabmap.db"
+        work_dir = merged_dir / "_merge_work"
+
+        runner_sources: list[SourceRtabmapScan] = []
+        for row in sources:
+            source_db = storage_root / row.storage_path / "rtabmap.db"
+            if not source_db.exists():
+                raise V1ServiceError(
+                    status_code=500,
+                    code="SOURCE_DB_MISSING",
+                    message=f"source rtabmap.db not found at {source_db}",
+                )
+            runner_sources.append(
+                SourceRtabmapScan(scan_id=str(row.scan_id), db_path=source_db)
+            )
+
+        logger.info(
+            "rtabmap multi-scan merge start floor_id=%s sources=%d merged_scan_id=%s",
+            floor_id,
+            len(runner_sources),
+            merged_scan_id,
+        )
+        try:
+            result = await runner.run(
+                sources=runner_sources,
+                output_db=merged_db_path,
+                work_dir=work_dir,
+                params=MultiScanReprocessParams(),
+                timeout_s=900.0,
+            )
+        except MultiScanRtabmapMergeError as e:
+            raise V1ServiceError(
+                status_code=503,
+                code="RTABMAP_REPROCESS_FAILED",
+                message=str(e),
+            ) from e
+
+        payload_sha256 = await asyncio.get_running_loop().run_in_executor(
+            None, _sha256_file, merged_db_path
+        )
+        file_size = merged_db_path.stat().st_size
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+        await self._session.execute(
+            sa.insert(t.scan_ingest).values(
+                scan_id=str(merged_scan_id),
+                payload_sha256=payload_sha256,
+                storage_path=rel_storage_path,
+                device_info=None,
+            )
+        )
         await self._session.execute(
             sa.update(t.floor_scan)
             .where(t.floor_scan.c.floor_id == str(floor_id))
             .values(active=False)
         )
+        max_order = (
+            await self._session.execute(
+                sa.select(sa.func.coalesce(sa.func.max(t.floor_scan.c.upload_order), 0))
+                .where(t.floor_scan.c.floor_id == str(floor_id))
+            )
+        ).scalar_one()
         await self._session.execute(
-            sa.update(t.floor_scan)
-            .where(t.floor_scan.c.floor_scan_id == row.floor_scan_id)
-            .values(active=True, status="MERGED")
+            sa.insert(t.floor_scan).values(
+                floor_id=str(floor_id),
+                scan_id=str(merged_scan_id),
+                file_name=f"merged_{merged_scan_id}.db",
+                file_size=file_size,
+                status="MERGED",
+                active=True,
+                upload_order=int(max_order) + 1,
+            )
         )
         await self._session.commit()
+        logger.info(
+            "rtabmap multi-scan merge complete floor_id=%s merged_scan_id=%s "
+            "duration=%.1fs nodes=%d loop_closures=%d",
+            floor_id,
+            merged_scan_id,
+            result.duration_s,
+            result.merged_node_count,
+            result.loop_closure_count,
+        )
         return MergedScanResponse(
             floor_id=floor_id,
-            active_scan_id=UUID(str(row.scan_id)),
-            status=await self._merge_status_for_scan(str(row.scan_id)),
+            active_scan_id=merged_scan_id,
+            status=await self._merge_status_for_scan(str(merged_scan_id)),
         )
 
     async def merge_status(self, floor_id: UUID) -> MergedScanResponse:
@@ -245,6 +397,14 @@ class ScanCompatService:
         if latest.state in (BuildState.PENDING, BuildState.RUNNING):
             return "PROCESSING"
         return "MERGED"
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 async def _save_upload(upload: UploadFile, dest: Path) -> int:

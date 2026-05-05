@@ -263,7 +263,12 @@ class Settings(BaseSettings):
     # ── V1 VPS adapter boundary ─────────────────────────────────────────────
     # mock: CI/dev fallback. slam_v3: use legacy be `/api/slam/v3/localize`
     # implementation against v2 scan_ingest/floor_scan DB state.
-    vps_localizer_mode: str = "mock"  # env: INDOOR_VPS_LOCALIZER_MODE
+    vps_localizer_mode: str = Field(
+        default="mock",
+        validation_alias=AliasChoices(
+            "INDOOR_VPS_LOCALIZER_MODE", "VPS_LOCALIZER_MODE"
+        ),
+    )
     vps_shared_volume_root: Path | None = None
     vps_http_base_url: str | None = None
 
