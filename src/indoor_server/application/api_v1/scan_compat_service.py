@@ -1,0 +1,300 @@
+"""V1 scan chunk/merge/process compatibility wrapper.
+
+The old V1 names are retained, but the implementation accepts only the new zip
+scan archive and routes it through `ScanIngestService` with auto enqueue.
+"""
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+from typing import Any
+from uuid import UUID, uuid4
+
+import sqlalchemy as sa
+from fastapi import UploadFile
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from indoor_server.application.api_v1.building_floor_service import BuildingFloorService
+from indoor_server.application.api_v1.errors import V1ServiceError
+from indoor_server.application.scan_ingest_service import ScanIngestService
+from indoor_server.application.sidecar_parser import SidecarParser
+from indoor_server.application.zip_unpacker import ZipUnpacker
+from indoor_server.config import settings
+from indoor_server.domain.building.enums import BuildState
+from indoor_server.infrastructure.db import tables as t
+from indoor_server.infrastructure.db.repositories.build_job_repo import BuildJobRepository
+from indoor_server.infrastructure.jobs.build_enqueuer import BuildEnqueuer
+from indoor_server.infrastructure.storage.local_fs import LocalFileStorage
+from indoor_server.interfaces.api.v1_schemas import (
+    MergedScanResponse,
+    ProcessingStatusResponse,
+    ScanChunkResponse,
+)
+
+
+class ScanCompatService:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def upload_archive(
+        self,
+        *,
+        floor_id: UUID,
+        upload: UploadFile,
+        scan_id: str | None,
+        device_info: str | None,
+        force: bool,
+    ) -> ScanChunkResponse:
+        if not _looks_like_zip(upload.filename):
+            raise V1ServiceError(
+                status_code=400,
+                code="ZIP_ARCHIVE_REQUIRED",
+                message="V1 chunk wrapper accepts only zip scan archives.",
+                detail={"filename": upload.filename},
+            )
+        await BuildingFloorService(self._session).get_floor(floor_id)
+
+        effective_scan_id = scan_id or str(uuid4())
+        tmp_dir = settings.tmp_root / uuid4().hex
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = tmp_dir / f"{effective_scan_id}.zip"
+
+        try:
+            file_size = await _save_upload(upload, zip_path)
+            enqueuer = BuildEnqueuer(self._session) if settings.build_auto_enqueue else None
+            result = await ScanIngestService(
+                unpacker=ZipUnpacker(),
+                parser=SidecarParser(),
+                store=LocalFileStorage(settings.storage_root),
+                session=self._session,
+                build_enqueuer=enqueuer,
+            ).ingest(
+                zip_path=zip_path,
+                expected_scan_id=effective_scan_id,
+                device_info=device_info,
+                force=force,
+                tmp_dir=tmp_dir,
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        row = await self._activate_floor_scan(
+            floor_id=floor_id,
+            scan_id=UUID(result.scan_id),
+            file_name=upload.filename,
+            file_size=file_size,
+            status_value="UPLOADED",
+        )
+        await self._session.commit()
+        return _chunk_response(row)
+
+    async def list_chunks(self, floor_id: UUID) -> list[ScanChunkResponse]:
+        await BuildingFloorService(self._session).get_floor(floor_id)
+        rows = (
+            await self._session.execute(
+                sa.select(t.floor_scan)
+                .where(t.floor_scan.c.floor_id == str(floor_id))
+                .order_by(t.floor_scan.c.upload_order.asc(), t.floor_scan.c.created_at.asc())
+            )
+        ).fetchall()
+        return [_chunk_response(row) for row in rows]
+
+    async def delete_chunk(self, floor_id: UUID, chunk_id: UUID) -> None:
+        result = await self._session.execute(
+            sa.delete(t.floor_scan).where(
+                t.floor_scan.c.floor_id == str(floor_id),
+                t.floor_scan.c.floor_scan_id == str(chunk_id),
+            )
+        )
+        if int(getattr(result, "rowcount", 0)) == 0:
+            raise V1ServiceError(404, "CHUNK_NOT_FOUND", "scan chunk not found")
+        await self._session.commit()
+
+    async def merge(self, floor_id: UUID, chunk_ids: list[UUID]) -> MergedScanResponse:
+        row = await self._select_chunk_for_merge(floor_id=floor_id, chunk_ids=chunk_ids)
+        await self._session.execute(
+            sa.update(t.floor_scan)
+            .where(t.floor_scan.c.floor_id == str(floor_id))
+            .values(active=False)
+        )
+        await self._session.execute(
+            sa.update(t.floor_scan)
+            .where(t.floor_scan.c.floor_scan_id == row.floor_scan_id)
+            .values(active=True, status="MERGED")
+        )
+        await self._session.commit()
+        return MergedScanResponse(
+            floor_id=floor_id,
+            active_scan_id=UUID(str(row.scan_id)),
+            status=await self._merge_status_for_scan(str(row.scan_id)),
+        )
+
+    async def merge_status(self, floor_id: UUID) -> MergedScanResponse:
+        active = await BuildingFloorService(self._session).get_active_scan_for_floor(floor_id)
+        return MergedScanResponse(
+            floor_id=floor_id,
+            active_scan_id=UUID(active.scan_id) if active is not None else None,
+            status=await self._merge_status_for_scan(active.scan_id) if active else "NOT_STARTED",
+        )
+
+    async def process(self, floor_id: UUID) -> ProcessingStatusResponse:
+        active = await BuildingFloorService(self._session).get_active_scan_for_floor(floor_id)
+        if active is None:
+            raise V1ServiceError(404, "ACTIVE_SCAN_NOT_FOUND", "active scan not found")
+
+        repo = BuildJobRepository(self._session)
+        latest = await repo.get_latest(active.scan_id)
+        if latest is not None and latest.state in (
+            BuildState.PENDING,
+            BuildState.RUNNING,
+            BuildState.SUCCEEDED,
+        ):
+            return _processing_response(floor_id, active.scan_id, latest)
+
+        job = await BuildEnqueuer(self._session).enqueue(active.scan_id)
+        await self._session.commit()
+        return _processing_response(floor_id, active.scan_id, job)
+
+    async def process_status(self, floor_id: UUID) -> ProcessingStatusResponse:
+        active = await BuildingFloorService(self._session).get_active_scan_for_floor(floor_id)
+        if active is None:
+            return ProcessingStatusResponse(floor_id=floor_id, scan_id=None, status="NOT_STARTED")
+        latest = await BuildJobRepository(self._session).get_latest(active.scan_id)
+        if latest is None:
+            return ProcessingStatusResponse(
+                floor_id=floor_id,
+                scan_id=UUID(active.scan_id),
+                status="NOT_STARTED",
+            )
+        return _processing_response(floor_id, active.scan_id, latest)
+
+    async def _activate_floor_scan(
+        self,
+        *,
+        floor_id: UUID,
+        scan_id: UUID,
+        file_name: str | None,
+        file_size: int,
+        status_value: str,
+    ) -> Any:
+        max_order = (
+            await self._session.execute(
+                sa.select(sa.func.coalesce(sa.func.max(t.floor_scan.c.upload_order), 0)).where(
+                    t.floor_scan.c.floor_id == str(floor_id)
+                )
+            )
+        ).scalar_one()
+        await self._session.execute(
+            sa.update(t.floor_scan)
+            .where(t.floor_scan.c.floor_id == str(floor_id))
+            .values(active=False)
+        )
+        insert_stmt = pg_insert(t.floor_scan).values(
+            floor_id=str(floor_id),
+            scan_id=str(scan_id),
+            file_name=file_name,
+            file_size=file_size,
+            status=status_value,
+            active=True,
+            upload_order=int(max_order) + 1,
+        )
+        stmt = insert_stmt.on_conflict_do_update(
+            constraint="uq_floor_scan_scan",
+            set_={
+                "file_name": file_name,
+                "file_size": file_size,
+                "status": status_value,
+                "active": True,
+            },
+        ).returning(t.floor_scan)
+        row = (await self._session.execute(stmt)).first()
+        assert row is not None
+        return row
+
+    async def _select_chunk_for_merge(self, *, floor_id: UUID, chunk_ids: list[UUID]) -> Any:
+        filters = [t.floor_scan.c.floor_id == str(floor_id)]
+        if chunk_ids:
+            chunk_id_strings = [str(value) for value in chunk_ids]
+            filters.append(
+                sa.or_(
+                    t.floor_scan.c.floor_scan_id.in_(chunk_id_strings),
+                    t.floor_scan.c.scan_id.in_(chunk_id_strings),
+                )
+            )
+        row = (
+            await self._session.execute(
+                sa.select(t.floor_scan)
+                .where(*filters)
+                .order_by(t.floor_scan.c.active.desc(), t.floor_scan.c.created_at.asc())
+                .limit(1)
+            )
+        ).first()
+        if row is None:
+            raise V1ServiceError(404, "CHUNK_NOT_FOUND", "scan chunk not found")
+        return row
+
+    async def _merge_status_for_scan(self, scan_id: str) -> str:
+        latest = await BuildJobRepository(self._session).get_latest(scan_id)
+        if latest is None:
+            return "MERGED"
+        if latest.state == BuildState.SUCCEEDED:
+            return "COMPLETED"
+        if latest.state == BuildState.FAILED:
+            return "FAILED"
+        if latest.state in (BuildState.PENDING, BuildState.RUNNING):
+            return "PROCESSING"
+        return "MERGED"
+
+
+async def _save_upload(upload: UploadFile, dest: Path) -> int:
+    total = 0
+    with open(dest, "wb") as f:
+        while chunk := await upload.read(1 << 18):
+            total += len(chunk)
+            if total > settings.max_upload_bytes:
+                raise V1ServiceError(413, "PAYLOAD_TOO_LARGE", "upload too large")
+            f.write(chunk)
+    return total
+
+
+def _looks_like_zip(filename: str | None) -> bool:
+    return bool(filename and filename.lower().endswith(".zip"))
+
+
+def _chunk_response(row: Any) -> ScanChunkResponse:
+    return ScanChunkResponse(
+        chunk_id=UUID(str(row.floor_scan_id)),
+        floor_id=UUID(str(row.floor_id)),
+        scan_id=UUID(str(row.scan_id)),
+        file_name=str(row.file_name) if row.file_name is not None else None,
+        file_size=int(row.file_size) if row.file_size is not None else None,
+        status=str(row.status),
+        active=bool(row.active),
+        upload_order=int(row.upload_order),
+        created_at=row.created_at,
+    )
+
+
+def _processing_response(
+    floor_id: UUID,
+    scan_id: str,
+    job: Any,
+) -> ProcessingStatusResponse:
+    state = str(job.state.value if hasattr(job.state, "value") else job.state)
+    mapped = {
+        "pending": "PROCESSING",
+        "running": "PROCESSING",
+        "succeeded": "COMPLETED",
+        "failed": "FAILED",
+        "cancelled": "FAILED",
+    }.get(state, "NOT_STARTED")
+    failure = getattr(job, "failure_detail", None)
+    return ProcessingStatusResponse(
+        floor_id=floor_id,
+        scan_id=UUID(scan_id),
+        build_job_id=job.build_job_id,
+        status=mapped,
+        progress=getattr(job, "progress", None),
+        error=str(failure) if failure is not None else None,
+    )

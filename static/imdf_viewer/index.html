@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IMDF Viewer — Indoor Pathfinding</title>
+  <link rel="stylesheet" href="viewer.css" />
+</head>
+<body>
+
+<!-- ── 상단 툴바 ── -->
+<div id="toolbar">
+  <h1>IMDF Viewer</h1>
+
+  <input
+    id="token-input"
+    type="text"
+    placeholder="Bearer 토큰 (dev-token)"
+    value="dev-token"
+  />
+
+  <select id="scan-select" title="빌드 완료된 scan 목록">
+    <option value="">— scan 선택 —</option>
+  </select>
+
+  <input
+    id="scan-id-input"
+    type="text"
+    placeholder="scan_id (UUID)"
+    style="width: 300px;"
+  />
+
+  <button id="btn-load">Load</button>
+
+  <span id="status-msg"></span>
+</div>
+
+<!-- ── 메인 영역 ── -->
+<div id="main">
+
+  <!-- ── 왼쪽 패널 ── -->
+  <div id="panel">
+
+    <!-- HUD -->
+    <div id="hud">
+      <h2>스캔 정보</h2>
+      <div id="hud-items">
+        <div class="hud-row">
+          <span class="hud-label">scan_id</span>
+          <span class="hud-value" id="hud-scan-id">—</span>
+        </div>
+        <div class="hud-row">
+          <span class="hud-label">build_job</span>
+          <span class="hud-value" id="hud-build-job">—</span>
+        </div>
+        <div class="hud-row">
+          <span class="hud-label">walkable_cells</span>
+          <span class="hud-value" id="hud-walkable">—</span>
+        </div>
+        <div class="hud-row">
+          <span class="hud-label">map_nodes</span>
+          <span class="hud-value" id="hud-nodes">—</span>
+        </div>
+        <div class="hud-row">
+          <span class="hud-label">map_edges</span>
+          <span class="hud-value" id="hud-edges">—</span>
+        </div>
+        <div class="hud-row">
+          <span class="hud-label">rectified</span>
+          <span class="hud-value" id="hud-rectified">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 레이어 토글 -->
+    <div id="layers">
+      <h2>레이어</h2>
+
+      <label class="layer-row">
+        <input type="checkbox" id="layer-footprint" />
+        <span class="layer-dot" style="background:#555; border: 1px solid #888;"></span>
+        <span class="layer-label">Footprint (외곽 영역)</span>
+      </label>
+
+      <label class="layer-row">
+        <input type="checkbox" id="layer-rectified" />
+        <span class="layer-dot" style="background:#d6b34a;"></span>
+        <span class="layer-label">Rectified outline</span>
+      </label>
+
+      <label class="layer-row">
+        <input type="checkbox" id="layer-edges" />
+        <span class="layer-dot" style="background:#27ae60;"></span>
+        <span class="layer-label">Graph 엣지</span>
+      </label>
+
+      <label class="layer-row">
+        <input type="checkbox" id="layer-nodes" />
+        <span class="layer-dot" style="background:#4a90d9;"></span>
+        <span class="layer-label">Graph 노드</span>
+      </label>
+
+      <label class="layer-row">
+        <input type="checkbox" id="layer-amenity" />
+        <span class="layer-dot" style="background:#e74c3c;"></span>
+        <span class="layer-label">Amenity (POI)</span>
+      </label>
+
+      <label class="layer-row">
+        <input type="checkbox" id="layer-anchor" />
+        <span class="layer-dot" style="background:#f1c40f;"></span>
+        <span class="layer-label">Anchor (원점)</span>
+      </label>
+    </div><!-- /layers -->
+
+    <!-- 범례 -->
+    <div style="padding: 10px 12px; border-top: 1px solid #333; margin-top: auto;">
+      <div style="font-size: 10px; color: #666; margin-bottom: 4px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;">노드 타입</div>
+      <div style="display:flex; flex-direction:column; gap:2px; font-size:11px;">
+        <div style="display:flex; align-items:center; gap:5px;">
+          <span style="width:8px;height:8px;border-radius:50%;background:#4a90d9;display:inline-block;"></span>skeleton/corridor
+        </div>
+        <div style="display:flex; align-items:center; gap:5px;">
+          <span style="width:8px;height:8px;border-radius:50%;background:#f39c12;display:inline-block;"></span>junction
+        </div>
+        <div style="display:flex; align-items:center; gap:5px;">
+          <span style="width:8px;height:8px;border-radius:50%;background:#888;display:inline-block;"></span>endpoint
+        </div>
+        <div style="display:flex; align-items:center; gap:5px;">
+          <span style="width:10px;height:10px;border-radius:50%;background:#e74c3c;display:inline-block;"></span>POI
+        </div>
+        <div style="display:flex; align-items:center; gap:5px; opacity:0.6;">
+          <span style="width:7px;height:7px;border-radius:50%;background:#e74c3c;display:inline-block;"></span>POI virtual
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /panel -->
+
+  <!-- ── SVG 뷰포트 ── -->
+  <div id="viewport">
+    <svg
+      id="svg-root"
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 100 100"
+      preserveAspectRatio="xMidYMid meet"
+    >
+      <!-- 레이어 그룹 — z-order: footprint → rectified → edges → nodes → amenity → anchor -->
+      <g id="g-footprint" class="layer-footprint"></g>
+      <g id="g-rectified" class="layer-rectified"></g>
+      <g id="g-edges" class="layer-edges"></g>
+      <g id="g-nodes" class="layer-nodes"></g>
+      <g id="g-amenity" class="layer-amenity"></g>
+      <g id="g-anchor" class="layer-anchor"></g>
+    </svg>
+
+    <div id="tooltip"></div>
+  </div><!-- /viewport -->
+
+</div><!-- /main -->
+
+<!-- JSZip CDN -->
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="viewer.js"></script>
+</body>
+</html>

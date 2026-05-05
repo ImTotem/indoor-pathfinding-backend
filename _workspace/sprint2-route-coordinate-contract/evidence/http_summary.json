@@ -1,0 +1,190 @@
+[
+  {
+    "name": "openapi",
+    "scenario": "GET /v3/api-docs",
+    "statusCode": 200,
+    "body": {
+      "targetPathPresent": true,
+      "targetMethods": [
+        "post"
+      ],
+      "compatPathsPresent": {
+        "/api/v1/buildings/{buildingId}/floors/{floorId}/routes/coordinates": true,
+        "/api/v1/buildings/{buildingId}/pathfinding": true,
+        "/mobile/v1/routes/coordinates": true,
+        "/route": true
+      },
+      "requestRequired": [
+        "start",
+        "goal"
+      ],
+      "requestAdditionalProperties": false,
+      "responseSchemaRef": "#/components/schemas/FloorCoordinateRouteResponse"
+    }
+  },
+  {
+    "name": "healthz",
+    "scenario": "GET /healthz",
+    "statusCode": 200,
+    "body": {
+      "status": "ok"
+    }
+  },
+  {
+    "name": "readyz",
+    "scenario": "GET /readyz",
+    "statusCode": 200,
+    "body": {
+      "status": "ok"
+    }
+  },
+  {
+    "name": "buildings",
+    "scenario": "GET /api/v1/buildings",
+    "statusCode": 200,
+    "body": {
+      "type": "list",
+      "count": 20
+    }
+  },
+  {
+    "name": "floor_path",
+    "scenario": "GET /api/v1/floors/{floorId}/path",
+    "statusCode": 200,
+    "body": {
+      "floorId": "6dd94e15-2ea8-4112-ab80-f24091a21853",
+      "scanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611",
+      "nodes": 52,
+      "edges": 80
+    }
+  },
+  {
+    "name": "success_route",
+    "scenario": "POST coordinate route with existing floor path coords",
+    "statusCode": 200,
+    "body": {
+      "buildingId": "0e0216d4-2007-4d8e-8c48-ae0ccf8cb44c",
+      "floorId": "6dd94e15-2ea8-4112-ab80-f24091a21853",
+      "scanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611",
+      "lengthM": 33.281499999999994,
+      "nodeCount": 17,
+      "pathGeometry": {
+        "type": "LineString",
+        "coordinateCount": 6
+      }
+    }
+  },
+  {
+    "name": "building_mismatch",
+    "scenario": "POST coordinate route with wrong buildingId",
+    "statusCode": 422,
+    "body": {
+      "code": "FLOOR_BUILDING_MISMATCH",
+      "message": "floorId does not belong to buildingId.",
+      "detail": {
+        "buildingId": "fa52440f-1078-4cbc-b3a8-faf8cd91c5af",
+        "floorId": "6dd94e15-2ea8-4112-ab80-f24091a21853"
+      }
+    }
+  },
+  {
+    "name": "active_scan_missing",
+    "scenario": "POST coordinate route for floor without active scan",
+    "statusCode": 404,
+    "body": {
+      "code": "ACTIVE_SCAN_NOT_FOUND",
+      "message": "floor has no active scan.",
+      "detail": {
+        "floorId": "b9f501e4-1b66-4dad-931a-09f9cb6811e9"
+      }
+    }
+  },
+  {
+    "name": "valid_missing_floor",
+    "scenario": "POST coordinate route with unknown valid UUIDs",
+    "statusCode": 404,
+    "body": {
+      "code": "FLOOR_NOT_FOUND",
+      "message": "floor not found",
+      "detail": null
+    }
+  },
+  {
+    "name": "extra_scanid",
+    "scenario": "POST coordinate route with forbidden scanId body field",
+    "statusCode": 422,
+    "body": {
+      "code": "VALIDATION_ERROR",
+      "message": "request validation failed",
+      "detail": {
+        "errors": [
+          {
+            "type": "extra_forbidden",
+            "loc": [
+              "body",
+              "scanId"
+            ],
+            "msg": "Extra inputs are not permitted",
+            "input": "00000000-0000-4000-8000-000000000003"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "missing_fields",
+    "scenario": "POST coordinate route with missing start/goal",
+    "statusCode": 422,
+    "body": {
+      "code": "VALIDATION_ERROR",
+      "message": "request validation failed",
+      "detail": {
+        "errors": [
+          {
+            "type": "missing",
+            "loc": [
+              "body",
+              "start"
+            ],
+            "msg": "Field required",
+            "input": {}
+          },
+          {
+            "type": "missing",
+            "loc": [
+              "body",
+              "goal"
+            ],
+            "msg": "Field required",
+            "input": {}
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "invalid_uuid",
+    "scenario": "POST coordinate route with invalid buildingId UUID",
+    "statusCode": 422,
+    "body": {
+      "code": "VALIDATION_ERROR",
+      "message": "request validation failed",
+      "detail": {
+        "errors": [
+          {
+            "type": "uuid_parsing",
+            "loc": [
+              "path",
+              "buildingId"
+            ],
+            "msg": "Input should be a valid UUID, invalid character: found `n` at 1",
+            "input": "not-a-uuid",
+            "ctx": {
+              "error": "invalid character: found `n` at 1"
+            }
+          }
+        ]
+      }
+    }
+  }
+]

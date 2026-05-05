@@ -1,0 +1,1 @@
+{"code":"VALIDATION_ERROR","message":"request validation failed","detail":{"errors":[{"type":"extra_forbidden","loc":["body","scanId"],"msg":"Extra inputs are not permitted","input":"00000000-0000-4000-8000-000000000003"}]}}

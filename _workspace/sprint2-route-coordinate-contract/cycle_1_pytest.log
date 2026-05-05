@@ -1,0 +1,11 @@
+............................                                             [100%]
+=============================== warnings summary ===============================
+tests/integration/api/test_route.py::test_t5_graph_not_ready
+tests/integration/api/test_route.py::test_t6_path_not_found
+tests/integration/api/test_route.py::test_t7_snap_distance_exceeded
+tests/integration/api/test_route.py::test_t9_poi_node_not_found
+  /Users/leehyeonsu/.pyenv/versions/3.11.11/lib/python3.11/site-packages/fastapi/routing.py:328: DeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated. Use 'HTTP_422_UNPROCESSABLE_CONTENT' instead.
+    return await dependant.call(**values)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+28 passed, 4 warnings in 0.71s

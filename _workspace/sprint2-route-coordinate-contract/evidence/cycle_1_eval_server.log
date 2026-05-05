@@ -1,0 +1,47 @@
+INFO:     Started server process [94984]
+INFO:     Waiting for application startup.
+INFO:utils.job_queue:SLAMJobQueue initialized
+INFO:utils.job_queue:SLAM job queue worker started
+INFO:utils.job_queue:Worker loop running, waiting for jobs...
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:18080 (Press CTRL+C to quit)
+INFO:     127.0.0.1:50195 - "GET /v3/api-docs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50197 - "GET /v3/api-docs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50198 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50199 - "GET /readyz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50205 - "POST /api/v1/buildings/00000000-0000-4000-8000-000000000001/floors/00000000-0000-4000-8000-000000000002/routes/coordinates HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:50206 - "POST /api/v1/buildings/00000000-0000-4000-8000-000000000001/floors/00000000-0000-4000-8000-000000000002/routes/coordinates HTTP/1.1" 422 Unprocessable Entity
+INFO:     127.0.0.1:50207 - "POST /api/v1/buildings/00000000-0000-4000-8000-000000000001/floors/00000000-0000-4000-8000-000000000002/routes/coordinates HTTP/1.1" 422 Unprocessable Entity
+INFO:     127.0.0.1:50208 - "POST /api/v1/buildings/not-a-uuid/floors/00000000-0000-4000-8000-000000000002/routes/coordinates HTTP/1.1" 422 Unprocessable Entity
+INFO:     127.0.0.1:50216 - "GET /api/v1/buildings HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50219 - "GET /api/v1/buildings HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50220 - "GET /api/v1/buildings/0e0216d4-2007-4d8e-8c48-ae0ccf8cb44c HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50222 - "GET /api/v1/buildings/fa52440f-1078-4cbc-b3a8-faf8cd91c5af HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50223 - "GET /api/v1/buildings/156e7167-437f-4f09-a456-cc66ca9d2faf HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50224 - "GET /api/v1/buildings/2b87ee32-6a11-44ff-acd6-fe04dccfba7f HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50225 - "GET /api/v1/buildings/174d0e0f-1397-4983-b422-d6b9c8a8a507 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50226 - "GET /api/v1/buildings/5497e12e-b01a-4f42-9edc-3395d6442f40 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50227 - "GET /api/v1/buildings/fcc37789-c76a-430c-964f-285ae9e809ba HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50228 - "GET /api/v1/buildings/cf3edebf-50b2-43f1-864a-755900a965b8 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50229 - "GET /api/v1/buildings/fcf9126e-e8d1-4ee1-84bb-2b3cc04aa031 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50230 - "GET /api/v1/buildings/66baf404-dc35-43a1-87f9-f8171c3314d5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50231 - "GET /api/v1/buildings/e4d287de-a025-48e7-8537-1dc4864a41b9 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50232 - "GET /api/v1/buildings/96d8f924-0fe0-47c6-8cf1-6901f77417fc HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50233 - "GET /api/v1/buildings/3fe61d8d-0795-426c-b354-4df2f1c42a3e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50234 - "GET /api/v1/buildings/65f156d3-edac-456b-b41a-691a668b9b74 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50235 - "GET /api/v1/buildings/76e3b8e4-8e1f-4ca6-bd89-efec5264db19 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50236 - "GET /api/v1/buildings/8b8c8808-2157-4aab-b374-6d2899e817a7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50237 - "GET /api/v1/buildings/5941d611-330b-4a18-8d83-e3184751119d HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50238 - "GET /api/v1/buildings/c2bbf4c1-ebc5-4a2e-b994-f51576994dad HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50239 - "GET /api/v1/buildings/ab719894-1732-43c0-8226-4bb9f992cb6f HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50240 - "GET /api/v1/buildings/1b806734-c9f0-43ad-93df-469caf280bf4 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50242 - "GET /api/v1/floors/6dd94e15-2ea8-4112-ab80-f24091a21853/path HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50243 - "POST /api/v1/buildings/0e0216d4-2007-4d8e-8c48-ae0ccf8cb44c/floors/6dd94e15-2ea8-4112-ab80-f24091a21853/routes/coordinates HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50246 - "POST /api/v1/buildings/fa52440f-1078-4cbc-b3a8-faf8cd91c5af/floors/6dd94e15-2ea8-4112-ab80-f24091a21853/routes/coordinates HTTP/1.1" 422 Unprocessable Entity
+INFO:     127.0.0.1:50248 - "POST /api/v1/buildings/fa52440f-1078-4cbc-b3a8-faf8cd91c5af/floors/b9f501e4-1b66-4dad-931a-09f9cb6811e9/routes/coordinates HTTP/1.1" 404 Not Found
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:utils.job_queue:Worker loop cancelled
+INFO:utils.job_queue:SLAMJobQueue shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [94984]

@@ -1,0 +1,2 @@
+"""Semantic map tests."""
+

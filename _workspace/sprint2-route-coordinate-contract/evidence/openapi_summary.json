@@ -1,0 +1,84 @@
+{
+  "compat_paths_present": {
+    "/api/v1/buildings/{buildingId}/floors/{floorId}/routes/coordinates": true,
+    "/api/v1/buildings/{buildingId}/pathfinding": true,
+    "/mobile/v1/routes/coordinates": true,
+    "/route": true
+  },
+  "openapi_title": "Indoor Pathfinding Server",
+  "openapi_version": "0.1.0",
+  "request_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "goal": {
+        "$ref": "#/components/schemas/CoordinatePoint"
+      },
+      "start": {
+        "$ref": "#/components/schemas/CoordinatePoint"
+      }
+    },
+    "required": [
+      "start",
+      "goal"
+    ],
+    "title": "FloorCoordinateRouteRequest",
+    "type": "object"
+  },
+  "request_schema_ref": "#/components/schemas/FloorCoordinateRouteRequest",
+  "response_schema": {
+    "properties": {
+      "buildingId": {
+        "format": "uuid",
+        "title": "Buildingid",
+        "type": "string"
+      },
+      "floorId": {
+        "format": "uuid",
+        "title": "Floorid",
+        "type": "string"
+      },
+      "lengthM": {
+        "title": "Lengthm",
+        "type": "number"
+      },
+      "nodeCount": {
+        "title": "Nodecount",
+        "type": "integer"
+      },
+      "pathGeometry": {
+        "additionalProperties": true,
+        "title": "Pathgeometry",
+        "type": "object"
+      },
+      "routeMetadata": {
+        "additionalProperties": true,
+        "title": "Routemetadata",
+        "type": "object"
+      },
+      "scanId": {
+        "format": "uuid",
+        "title": "Scanid",
+        "type": "string"
+      },
+      "snapInfo": {
+        "$ref": "#/components/schemas/V1RouteSnapInfo"
+      }
+    },
+    "required": [
+      "buildingId",
+      "floorId",
+      "scanId",
+      "pathGeometry",
+      "lengthM",
+      "nodeCount",
+      "snapInfo"
+    ],
+    "title": "FloorCoordinateRouteResponse",
+    "type": "object"
+  },
+  "response_schema_ref": "#/components/schemas/FloorCoordinateRouteResponse",
+  "target_methods": [
+    "post"
+  ],
+  "target_path_present": true
+}

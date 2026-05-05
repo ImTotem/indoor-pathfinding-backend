@@ -1,0 +1,219 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  font-size: 13px;
+  background: #111;
+  color: #e0e0e0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── 상단 툴바 ── */
+#toolbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+}
+
+#toolbar h1 {
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  margin-right: 8px;
+}
+
+#toolbar input[type="text"] {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #e0e0e0;
+  padding: 4px 8px;
+  font-size: 12px;
+  width: 260px;
+}
+
+#toolbar input[type="text"]:focus {
+  outline: none;
+  border-color: #666;
+}
+
+#toolbar select {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #e0e0e0;
+  padding: 4px 8px;
+  font-size: 12px;
+  min-width: 200px;
+}
+
+#toolbar button {
+  background: #2d6a4f;
+  border: none;
+  border-radius: 4px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 5px 12px;
+}
+#toolbar button:hover { background: #3a8c68; }
+#toolbar button:disabled { background: #333; color: #666; cursor: not-allowed; }
+
+#status-msg {
+  margin-left: auto;
+  font-size: 11px;
+  color: #888;
+}
+#status-msg.error { color: #e05a5a; }
+#status-msg.ok { color: #5ae05a; }
+
+/* ── 메인 영역 ── */
+#main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+/* ── 왼쪽 패널 ── */
+#panel {
+  flex-shrink: 0;
+  width: 220px;
+  background: #1a1a1a;
+  border-right: 1px solid #333;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+#hud {
+  padding: 10px 12px;
+  border-bottom: 1px solid #333;
+}
+
+#hud h2 {
+  font-size: 11px;
+  font-weight: 700;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+
+#hud-items { display: flex; flex-direction: column; gap: 3px; }
+.hud-row { display: flex; justify-content: space-between; }
+.hud-label { color: #888; }
+.hud-value { color: #e0e0e0; font-variant-numeric: tabular-nums; }
+
+#layers {
+  padding: 10px 12px;
+}
+
+#layers h2 {
+  font-size: 11px;
+  font-weight: 700;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 8px;
+}
+
+.layer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  cursor: pointer;
+  user-select: none;
+}
+.layer-row:hover .layer-label { color: #fff; }
+
+.layer-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.layer-label {
+  font-size: 12px;
+  color: #ccc;
+}
+
+input[type="checkbox"] { accent-color: #5ae05a; }
+
+/* ── SVG 뷰포트 ── */
+#viewport {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: #0d0d0d;
+  cursor: grab;
+}
+#viewport:active { cursor: grabbing; }
+
+#svg-root {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+}
+
+/* SVG 요소 스타일 */
+.layer-footprint path, .layer-footprint polygon {
+  fill: rgba(60, 60, 70, 0.7);
+  stroke: #555;
+  stroke-width: 0.3;
+}
+
+.layer-rectified path, .layer-rectified polygon {
+  fill: none;
+  stroke: #d6b34a;
+  stroke-width: 0.45;
+  stroke-dasharray: 1.2 0.7;
+}
+
+.layer-edges line, .layer-edges path {
+  stroke: #27ae60;
+  stroke-width: 0.5;
+  fill: none;
+}
+
+.node-skeleton { fill: #4a90d9; }
+.node-junction  { fill: #f39c12; }
+.node-endpoint  { fill: #888; }
+.node-poi       { fill: #e74c3c; }
+.node-poi-virtual { fill: #e74c3c; opacity: 0.6; }
+
+.layer-amenity text {
+  font-size: 2px;
+  fill: #e74c3c;
+  dominant-baseline: hanging;
+}
+
+.layer-anchor line { stroke: #f1c40f; stroke-width: 0.5; }
+.layer-anchor text {
+  font-size: 1.8px;
+  fill: #f1c40f;
+}
+
+/* ── 툴팁 ── */
+#tooltip {
+  position: absolute;
+  background: rgba(20, 20, 20, 0.95);
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 11px;
+  color: #e0e0e0;
+  pointer-events: none;
+  white-space: pre-line;
+  max-width: 200px;
+  display: none;
+  z-index: 100;
+}

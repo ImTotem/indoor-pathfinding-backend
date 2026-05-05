@@ -1,0 +1,43 @@
+# Sprint 65: rtabmap-reprocess CLI 가 필요. base image 를 introlab3it/rtabmap 으로 두고
+# 위에 python 3.11 + uv 를 설치한다. 이미지 크지만 의존성 누락 위험 0.
+#
+# Sprint 67: PyAV (av>=12.0.0) 추가됨. PyAV manylinux 휠이 libav* 정적 번들 → system
+# ffmpeg 추가 설치 불필요. uv sync 시 자동으로 휠 설치.
+#
+# Dev 환경(M4 macOS) 에서는 native homebrew rtabmap + brew ffmpeg 사용 가능 —
+# docker 없이도 worker 동작. 본 Dockerfile 은 production / 시연 배포용.
+
+FROM introlab3it/rtabmap:noble
+
+# Python 3.11 + venv 설치
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-venv python3-pip ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# python3 → python3.11 우선
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+# uv 설치
+COPY --from=ghcr.io/astral-sh/uv:0.11.7 /uv /uvx /usr/local/bin/
+
+WORKDIR /app
+ENV PYTHONPATH=/app/src:/app/be:/app
+
+# rtabmap binary 가용성 검증 (이미지 빌드 시점)
+RUN rtabmap-reprocess 2>&1 | head -1 || true
+RUN command -v rtabmap-reprocess
+
+# 의존성 레이어 캐시
+COPY pyproject.toml uv.lock* ./
+RUN uv sync --no-dev --frozen
+
+# 소스 복사
+COPY src ./src
+COPY be ./be
+COPY alembic ./alembic
+COPY alembic.ini .
+
+# 저장소/임시 디렉터리
+RUN mkdir -p var/storage var/tmp/uploads be/data/maps be/data/tmp
+
+EXPOSE 8000

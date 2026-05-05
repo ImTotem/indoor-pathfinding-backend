@@ -1,0 +1,8 @@
+torch>=2.3.0
+torchvision>=0.18.0
+segmentation-models-pytorch>=0.3.4
+numpy>=1.26.0
+opencv-python-headless>=4.9.0
+matplotlib>=3.8.0
+shapely>=2.0.0
+scipy>=1.13.0

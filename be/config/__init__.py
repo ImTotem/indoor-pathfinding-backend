@@ -1,0 +1,1 @@
+"""Legacy SLAM config package."""

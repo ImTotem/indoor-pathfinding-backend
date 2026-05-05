@@ -1,0 +1,1 @@
+{"code":"FLOOR_BUILDING_MISMATCH","message":"floorId does not belong to buildingId.","detail":{"buildingId":"fa52440f-1078-4cbc-b3a8-faf8cd91c5af","floorId":"6dd94e15-2ea8-4112-ab80-f24091a21853"}}

@@ -1,0 +1,67 @@
+services:
+  db:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.db
+    environment:
+      POSTGRES_USER: indoor
+      POSTGRES_PASSWORD: indoor
+      POSTGRES_DB: indoor
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-pgvector.sql:/docker-entrypoint-initdb.d/01-pgvector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U indoor"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://indoor:indoor@db:5432/indoor
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: indoor
+      POSTGRES_USER: indoor
+      POSTGRES_PASSWORD: indoor
+      STORAGE_ROOT: /app/var/storage
+      DATA_DIR: /app/be/data
+      INDOOR_VPS_LOCALIZER_MODE: slam_v3
+      PYTHONPATH: /app/src:/app/be:/app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./var:/app/var
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "uv run alembic upgrade head && uv run uvicorn indoor_server.main:app --host 0.0.0.0 --port 8000"
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://indoor:indoor@db:5432/indoor
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: indoor
+      POSTGRES_USER: indoor
+      POSTGRES_PASSWORD: indoor
+      STORAGE_ROOT: /app/var/storage
+      DATA_DIR: /app/be/data
+      PYTHONPATH: /app/src:/app/be:/app
+    volumes:
+      - ./var:/app/var
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "indoor_server.worker"]
+    stop_grace_period: 600s
+
+volumes:
+  pgdata:

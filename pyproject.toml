@@ -1,0 +1,109 @@
+[project]
+name = "indoor-server"
+version = "0.1.0"
+description = "Indoor pathfinding server — scan upload & metadata ingest"
+readme = "README.md"
+authors = [
+    { name = "leehyeonsu", email = "leehyeonsu4888@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.29.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "sqlalchemy[asyncio]>=2.0.30",
+    "alembic>=1.13.0",
+    "asyncpg>=0.29.0",
+    "psycopg[binary]>=3.1.19",
+    "python-multipart>=0.0.9",
+    "geoalchemy2>=0.15.0",
+    # Sprint 16: Build Phase
+    "onnxruntime>=1.17.0",
+    "huggingface-hub>=0.23.0",
+    "pillow>=10.0.0",
+    "numpy>=1.26.0",
+    "scikit-image>=0.22.0",
+    "networkx>=3.3",
+    "shapely>=2.0.0",
+    "opencv-contrib-python>=4.9.0",
+    "scipy>=1.13.0",
+    "python-dotenv>=1.0.0",
+    # Sprint 67: HEVC video decode + PTS-based pose matching.
+    # PyAV pre-built wheel (manylinux + macOS). libav* hevc_videotoolbox / GPU 자동.
+    "av>=12.0.0",
+    "kornia>=0.8.2",
+    "lightglue",
+    "torch>=2.3.0",
+    "torchvision>=0.18.0",
+    # Sprint 83: SegFormer-b0 ADE20K floor segmentation
+    "transformers>=4.40.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+    "aiosqlite>=0.20.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
+
+[project.scripts]
+indoor-server = "indoor_server.main:run"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+extend-exclude = ["be"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "N"]
+ignore = ["B008", "N818"]
+
+# 스크립트(개발자 CLI, 진단 도구)와 Sprint 20 실패 보존 파일은 규칙 완화.
+# production 경로(src/indoor_server/**)는 strict 유지.
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E501", "I001", "N806", "N803", "B007"]
+"src/indoor_server/application/building/steps/multiview_scale.py" = ["E501", "F401", "C420", "B007"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+exclude = [
+    "^\\.venv/",
+    "^\\.pytest_cache/",
+    "^var/",
+    "^alembic/",
+    "^scripts/",
+    "^tests/",
+]
+
+[[tool.mypy.overrides]]
+module = ["scripts.*"]
+follow_imports = "silent"
+ignore_errors = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src", "be", "."]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: Postgres 실 연결이 필요한 통합 테스트 (pytest -m integration으로 실행)",
+]
+
+[tool.uv.sources]
+lightglue = { git = "https://github.com/cvg/LightGlue.git" }
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.10.9",
+]

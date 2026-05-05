@@ -1,0 +1,245 @@
+[
+  {
+    "buildingId": "0e0216d4-2007-4d8e-8c48-ae0ccf8cb44c",
+    "buildingName": "s78-c2-env-off-test",
+    "floorId": "6dd94e15-2ea8-4112-ab80-f24091a21853",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "fa52440f-1078-4cbc-b3a8-faf8cd91c5af",
+    "buildingName": "s78-c2-s8-eval",
+    "floorId": "0ab1f67a-b8e1-424d-9dea-55a7ba347dd7",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "fa52440f-1078-4cbc-b3a8-faf8cd91c5af",
+    "buildingName": "s78-c2-s8-eval",
+    "floorId": "b9f501e4-1b66-4dad-931a-09f9cb6811e9",
+    "floorName": "2F",
+    "level": 2,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "2b87ee32-6a11-44ff-acd6-fe04dccfba7f",
+    "buildingName": "smoke-test-building",
+    "floorId": "8b46bec6-cbab-4959-9bfd-02ca4829e163",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "2b87ee32-6a11-44ff-acd6-fe04dccfba7f",
+    "buildingName": "smoke-test-building",
+    "floorId": "1fb187c1-c653-49c6-b0fb-3941c7e139a5",
+    "floorName": "2F",
+    "level": 2,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "174d0e0f-1397-4983-b422-d6b9c8a8a507",
+    "buildingName": "s78-s7-fresh",
+    "floorId": "999a801a-01f8-4aef-a3a8-e4d0b2980c57",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "174d0e0f-1397-4983-b422-d6b9c8a8a507",
+    "buildingName": "s78-s7-fresh",
+    "floorId": "6c1ce7dc-61c2-44a1-bf62-fa819e8aa572",
+    "floorName": "2F",
+    "level": 2,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "5497e12e-b01a-4f42-9edc-3395d6442f40",
+    "buildingName": "s78-main-building",
+    "floorId": "71cdc05e-ceb9-4859-b0ed-8433b60608ff",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "869968c8-2441-49eb-a6d7-09977d6072d8"
+  },
+  {
+    "buildingId": "5497e12e-b01a-4f42-9edc-3395d6442f40",
+    "buildingName": "s78-main-building",
+    "floorId": "197693f0-4e18-42ef-9755-4b6f71109cd1",
+    "floorName": "2F",
+    "level": 2,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "fcc37789-c76a-430c-964f-285ae9e809ba",
+    "buildingName": "s78-h1-test-indoor-prefix-false",
+    "floorId": "2a06e112-968c-4a2c-9ca5-bbe93f4ad473",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "fcc37789-c76a-430c-964f-285ae9e809ba",
+    "buildingName": "s78-h1-test-indoor-prefix-false",
+    "floorId": "1ae8f973-1f10-4941-a042-8e17996666df",
+    "floorName": "2F",
+    "level": 2,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "fcf9126e-e8d1-4ee1-84bb-2b3cc04aa031",
+    "buildingName": "s78-h1-test-indoor-server-env",
+    "floorId": "82c1859d-f592-459c-816e-fd2fc63becba",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "fcf9126e-e8d1-4ee1-84bb-2b3cc04aa031",
+    "buildingName": "s78-h1-test-indoor-server-env",
+    "floorId": "1a8c16d8-8a67-450c-ae67-ad547dbc6f68",
+    "floorName": "2F",
+    "level": 2,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "66baf404-dc35-43a1-87f9-f8171c3314d5",
+    "buildingName": "테스트빌딩A",
+    "floorId": "1d7657e6-fa2f-4d4f-95a3-4b0407d140cf",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "66baf404-dc35-43a1-87f9-f8171c3314d5",
+    "buildingName": "테스트빌딩A",
+    "floorId": "883ecb64-9a1b-4e23-9486-acb87f75cb49",
+    "floorName": "2F",
+    "level": 2,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "e4d287de-a025-48e7-8537-1dc4864a41b9",
+    "buildingName": "graph-visual-v2-smoke",
+    "floorId": "eec6ab90-9141-4335-8ece-e33e1328922d",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "96d8f924-0fe0-47c6-8cf1-6901f77417fc",
+    "buildingName": "smoke-fresh",
+    "floorId": "868066b1-baaa-4e2e-98c7-47dc31fb42b9",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "3fe61d8d-0795-426c-b354-4df2f1c42a3e",
+    "buildingName": "smoke-c3-updated",
+    "floorId": "b37148dc-46f3-4141-988a-ab23c3f6cd72",
+    "floorName": "B1F",
+    "level": -1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "3fe61d8d-0795-426c-b354-4df2f1c42a3e",
+    "buildingName": "smoke-c3-updated",
+    "floorId": "05ab7d48-f699-4225-b2f0-a8b03b0bfd88",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "65f156d3-edac-456b-b41a-691a668b9b74",
+    "buildingName": "공학1관-C3-smoke3",
+    "floorId": "50d985b5-3472-4e8a-8882-7ee19821f359",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "76e3b8e4-8e1f-4ca6-bd89-efec5264db19",
+    "buildingName": "공학1관-C3-smoke2",
+    "floorId": "bb2a565f-9eed-4d13-9ef0-bfb46c395f88",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "8b8c8808-2157-4aab-b374-6d2899e817a7",
+    "buildingName": "공학1관-C3-smoke",
+    "floorId": "2b55c788-67af-4944-9505-5adb0b805203",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "7b018dca-50c2-4f1b-bb79-db3b6f081611"
+  },
+  {
+    "buildingId": "5941d611-330b-4a18-8d83-e3184751119d",
+    "buildingName": "공학1관-C3",
+    "floorId": "446bfad1-c19c-43f9-a9c3-39bb2c9b9159",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "ab719894-1732-43c0-8226-4bb9f992cb6f",
+    "buildingName": "공학1관-C2(개정)",
+    "floorId": "eacff6c9-2873-40ce-acfe-cd341054473c",
+    "floorName": "B1F",
+    "level": -1,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "ab719894-1732-43c0-8226-4bb9f992cb6f",
+    "buildingName": "공학1관-C2(개정)",
+    "floorId": "aea911ec-a112-4687-9595-86e43fa408c7",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "1b806734-c9f0-43ad-93df-469caf280bf4",
+    "buildingName": "공학 1관(개정)",
+    "floorId": "767f6229-2980-4024-863b-5be128d34eb4",
+    "floorName": "B1",
+    "level": -1,
+    "hasPath": false,
+    "activeScanId": null
+  },
+  {
+    "buildingId": "1b806734-c9f0-43ad-93df-469caf280bf4",
+    "buildingName": "공학 1관(개정)",
+    "floorId": "49141187-c709-4af6-9764-3929d5a7db27",
+    "floorName": "1F",
+    "level": 1,
+    "hasPath": true,
+    "activeScanId": "869968c8-2441-49eb-a6d7-09977d6072d8"
+  }
+]
