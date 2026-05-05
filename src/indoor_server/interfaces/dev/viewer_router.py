@@ -14,7 +14,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from indoor_server.domain.building.enums import BuildState
 from indoor_server.infrastructure.db import tables as t
 from indoor_server.infrastructure.db.engine import get_session
-from indoor_server.interfaces.api.auth import require_ingest_token
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +22,6 @@ dev_router = APIRouter(prefix="/dev/api", tags=["dev-viewer"])
 
 @dev_router.get(
     "/scans",
-    dependencies=[Depends(require_ingest_token)],
 )
 async def list_scans(
     session: AsyncSession = Depends(get_session),

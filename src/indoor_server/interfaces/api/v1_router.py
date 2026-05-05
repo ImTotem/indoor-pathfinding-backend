@@ -5,6 +5,7 @@ current zip ingest, auto build, semantic POI, and route APIs.
 """
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Any, NoReturn
 from uuid import UUID
 
@@ -47,6 +48,8 @@ from indoor_server.interfaces.api.v1_schemas import (
     V1ErrorResponse,
     VerticalPassageResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 v1_router = APIRouter(prefix="/api/v1")
 
@@ -497,10 +500,33 @@ async def post_localize(
 ) -> LocalizeResponse:
     try:
         image_bytes = [await image.read() for image in images]
-        return await LocalizationAdapter(session).localize(
+        sizes = [len(b) for b in image_bytes]
+        filenames = [img.filename for img in images]
+        content_types = [img.content_type for img in images]
+        logger.info(
+            "localize request: building_id=%s images=%d filenames=%s "
+            "content_types=%s sizes_bytes=%s total_bytes=%d",
+            building_id,
+            len(image_bytes),
+            filenames,
+            content_types,
+            sizes,
+            sum(sizes),
+        )
+        response = await LocalizationAdapter(session).localize(
             building_id=building_id,
             images=image_bytes,
         )
+        logger.info(
+            "localize response: building_id=%s map_id=%s confidence=%.4f "
+            "pose=%s candidates=%d",
+            building_id,
+            response.map_id,
+            response.confidence,
+            response.pose,
+            len(response.candidates),
+        )
+        return response
     except V1ServiceError as e:
         _raise_v1(e)
 

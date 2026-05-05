@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -13,6 +14,11 @@ from indoor_server.infrastructure.db.tables import metadata
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+# docker compose / production: DATABASE_URL 환경변수로 alembic.ini 의 localhost URL 덮어쓰기
+_env_db_url = os.getenv("DATABASE_URL")
+if _env_db_url:
+    config.set_main_option("sqlalchemy.url", _env_db_url)
 
 target_metadata = metadata
 

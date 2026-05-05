@@ -47,7 +47,6 @@ from indoor_server.infrastructure.db.repositories.scan_ingest_repo import (
 )
 from indoor_server.infrastructure.jobs.build_enqueuer import BuildEnqueuer
 from indoor_server.infrastructure.storage.local_fs import LocalFileStorage
-from indoor_server.interfaces.api.auth import require_ingest_token
 from indoor_server.interfaces.api.schemas import (
     ApiError,
     BuildCounts,
@@ -82,7 +81,6 @@ _store = LocalFileStorage(settings.storage_root)
     response_model=ScanUploadResponse,
     status_code=status.HTTP_200_OK,
     tags=["scan"],
-    dependencies=[Depends(require_ingest_token)],
 )
 async def upload_scan(
     payload: UploadFile,
@@ -145,7 +143,6 @@ async def upload_scan(
     response_model=ScanStatusResponse,
     status_code=status.HTTP_200_OK,
     tags=["scan"],
-    dependencies=[Depends(require_ingest_token)],
 )
 async def get_scan(
     scan_id: str,
@@ -196,7 +193,6 @@ async def get_scan(
     response_model=BuildEnqueueResponse,
     status_code=status.HTTP_202_ACCEPTED,
     tags=["build"],
-    dependencies=[Depends(require_ingest_token)],
 )
 async def trigger_build(
     scan_id: str,
@@ -247,7 +243,6 @@ async def trigger_build(
     response_model=BuildStatusResponse,
     status_code=status.HTTP_200_OK,
     tags=["build"],
-    dependencies=[Depends(require_ingest_token)],
 )
 async def get_build_status(
     scan_id: str,
@@ -295,7 +290,6 @@ async def get_build_status(
     response_model=GraphFeatureCollection,
     status_code=status.HTTP_200_OK,
     tags=["build"],
-    dependencies=[Depends(require_ingest_token)],
 )
 async def get_graph(
     scan_id: str,
@@ -356,7 +350,6 @@ async def get_graph(
     response_model=RouteResponse,
     status_code=status.HTTP_200_OK,
     tags=["route"],
-    dependencies=[Depends(require_ingest_token)],
 )
 async def post_route(
     request: RouteRequest,
@@ -484,7 +477,6 @@ async def post_route(
     response_model=RouteResponse,
     status_code=status.HTTP_200_OK,
     tags=["mobile", "route"],
-    dependencies=[Depends(require_ingest_token)],
 )
 async def post_mobile_coordinate_route(
     request: CoordinateRouteRequest,
@@ -511,7 +503,6 @@ async def post_mobile_coordinate_route(
     "/scan/{scan_id}/imdf",
     status_code=200,
     tags=["imdf"],
-    dependencies=[Depends(require_ingest_token)],
     responses={
         200: {"content": {"application/zip": {}}},
         404: {"model": ApiError},

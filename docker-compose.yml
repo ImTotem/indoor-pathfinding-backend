@@ -33,14 +33,20 @@ services:
       INDOOR_VPS_LOCALIZER_MODE: slam_v3
       PYTHONPATH: /app/src:/app/be:/app
     ports:
-      - "8000:8000"
+      - "8080:8000"
     volumes:
       - ./var:/app/var
+      # Dev: 소스 bind mount → 코드 수정 시 재빌드 불필요 (restart 만)
+      - ./src:/app/src
+      - ./be:/app/be
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+      - ./scripts:/app/scripts
     depends_on:
       db:
         condition: service_healthy
     command: >
-      sh -c "uv run alembic upgrade head && uv run uvicorn indoor_server.main:app --host 0.0.0.0 --port 8000"
+      sh -c "uv run alembic upgrade head && uv run uvicorn indoor_server.main:app --host 0.0.0.0 --port 8000 --reload"
 
   worker:
     build: .
@@ -57,6 +63,12 @@ services:
       PYTHONPATH: /app/src:/app/be:/app
     volumes:
       - ./var:/app/var
+      # Dev: 소스 bind mount → 코드 수정 시 restart 만 (재빌드 불필요)
+      - ./src:/app/src
+      - ./be:/app/be
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+      - ./scripts:/app/scripts
     depends_on:
       db:
         condition: service_healthy

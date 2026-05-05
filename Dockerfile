@@ -10,8 +10,13 @@
 FROM introlab3it/rtabmap:noble
 
 # Python 3.11 + venv 설치
+# Ubuntu 24.04 (noble) 기본 저장소는 python3.12만 제공 → deadsnakes PPA 에서 3.11 설치
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-venv python3-pip ca-certificates curl \
+        software-properties-common ca-certificates curl gnupg \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # python3 → python3.11 우선
@@ -27,15 +32,23 @@ ENV PYTHONPATH=/app/src:/app/be:/app
 RUN rtabmap-reprocess 2>&1 | head -1 || true
 RUN command -v rtabmap-reprocess
 
-# 의존성 레이어 캐시
-COPY pyproject.toml uv.lock* ./
-RUN uv sync --no-dev --frozen
+# 의존성 레이어 캐시 (프로젝트 본체 제외 — src/ 복사 전이라 빌드 불가)
+COPY pyproject.toml uv.lock* README.md ./
+RUN uv sync --no-dev --frozen --no-install-project
 
 # 소스 복사
 COPY src ./src
 COPY be ./be
 COPY alembic ./alembic
 COPY alembic.ini .
+COPY scripts ./scripts
+
+# 프로젝트 본체 설치
+RUN uv sync --no-dev --frozen
+
+# venv 의 python/uvicorn/alembic 등을 시스템 PATH 로 노출
+# (compose 의 `python -m indoor_server.worker` 가 venv 의 python 으로 resolve 됨)
+ENV PATH="/app/.venv/bin:${PATH}"
 
 # 저장소/임시 디렉터리
 RUN mkdir -p var/storage var/tmp/uploads be/data/maps be/data/tmp

@@ -65,6 +65,7 @@ class BuildingFloorService:
                 description=request.description,
                 latitude=request.latitude,
                 longitude=request.longitude,
+                status="ACTIVE",
             )
             .returning(t.building)
         )
