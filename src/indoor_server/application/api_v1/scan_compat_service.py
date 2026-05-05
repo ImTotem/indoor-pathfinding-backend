@@ -195,9 +195,14 @@ class ScanCompatService:
         merged_dir = storage_root / rel_storage_path
         merged_db_path = merged_dir / "rtabmap.db"
         work_dir = merged_dir / "_merge_work"
+        work_dir.mkdir(parents=True, exist_ok=True)
 
-        runner_sources: list[SourceRtabmapScan] = []
-        for row in sources:
+        # Stage 1: 각 source 단독 reprocess.
+        # rtabmap-reprocess `-a` (append) 모드는 첫 .db 를 init 으로 두고 둘째부터만
+        # reprocess → 첫 source 노드에 SIFT feature/depth back-projection 안 됨.
+        # 따라서 각 source 를 단독으로 먼저 돌려 Feature/Word 를 채운 뒤 -a merge 한다.
+        single_reprocessed: list[SourceRtabmapScan] = []
+        for index, row in enumerate(sources):
             source_db = storage_root / row.storage_path / "rtabmap.db"
             if not source_db.exists():
                 raise V1ServiceError(
@@ -205,21 +210,45 @@ class ScanCompatService:
                     code="SOURCE_DB_MISSING",
                     message=f"source rtabmap.db not found at {source_db}",
                 )
-            runner_sources.append(
-                SourceRtabmapScan(scan_id=str(row.scan_id), db_path=source_db)
+            stage1_out = work_dir / f"stage1_{index:02d}_{row.scan_id}.db"
+            if stage1_out.exists():
+                stage1_out.unlink()
+            logger.info(
+                "rtabmap single reprocess start (stage1) scan_id=%s input=%s output=%s",
+                row.scan_id,
+                source_db,
+                stage1_out,
+            )
+            try:
+                await _run_rtabmap_reprocess_single(
+                    binary_path=runner.binary_path or "rtabmap-reprocess",
+                    input_db=source_db,
+                    output_db=stage1_out,
+                    timeout_s=600.0,
+                )
+            except _ReprocessFailed as e:
+                raise V1ServiceError(
+                    status_code=503,
+                    code="RTABMAP_REPROCESS_FAILED",
+                    message=f"single reprocess failed for scan {row.scan_id}: {e}",
+                ) from e
+            single_reprocessed.append(
+                SourceRtabmapScan(scan_id=str(row.scan_id), db_path=stage1_out)
             )
 
+        # Stage 2: 단독 reprocess 결과들을 -a 로 multi-scan merge.
         logger.info(
-            "rtabmap multi-scan merge start floor_id=%s sources=%d merged_scan_id=%s",
+            "rtabmap multi-scan merge start (stage2) floor_id=%s sources=%d "
+            "merged_scan_id=%s",
             floor_id,
-            len(runner_sources),
+            len(single_reprocessed),
             merged_scan_id,
         )
         try:
             result = await runner.run(
-                sources=runner_sources,
+                sources=single_reprocessed,
                 output_db=merged_db_path,
-                work_dir=work_dir,
+                work_dir=work_dir / "stage2",
                 params=MultiScanReprocessParams(),
                 timeout_s=900.0,
             )
@@ -405,6 +434,54 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+class _ReprocessFailed(Exception):
+    """single rtabmap-reprocess invocation failed."""
+
+
+async def _run_rtabmap_reprocess_single(
+    *,
+    binary_path: str,
+    input_db: Path,
+    output_db: Path,
+    timeout_s: float,
+) -> None:
+    """단독 reprocess: input.db 의 모든 노드에 SIFT feature + 3D back-projection 강제.
+
+    `-default` 로 input db 의 params 를 무시하고 default 를 사용해야 클라이언트가
+    `Mem/IncrementalMemory=false` 등으로 박아 보낸 db 도 정상 reprocess 된다.
+    `--Vis/FeatureType 1` + `--Kp/DetectorStrategy 1` 로 SIFT 강제.
+    """
+    output_db.parent.mkdir(parents=True, exist_ok=True)
+    if output_db.exists():
+        output_db.unlink()
+    cmd = [
+        binary_path,
+        "-default",
+        "--Mem/IncrementalMemory", "true",
+        "--Vis/FeatureType", "1",
+        "--Kp/DetectorStrategy", "1",
+        "--uwarn",
+        str(input_db),
+        str(output_db),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except TimeoutError as e:
+        proc.kill()
+        await proc.wait()
+        raise _ReprocessFailed(f"timeout > {timeout_s}s") from e
+    if proc.returncode != 0:
+        stderr_text = stderr_b.decode(errors="replace") if stderr_b else ""
+        raise _ReprocessFailed(
+            f"exit {proc.returncode}; stderr tail: {stderr_text[-1200:]}"
+        )
 
 
 async def _save_upload(upload: UploadFile, dest: Path) -> int:
