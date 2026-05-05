@@ -102,6 +102,16 @@ markers = [
 
 [tool.uv.sources]
 lightglue = { git = "https://github.com/cvg/LightGlue.git" }
+# torch/torchvision 은 NVIDIA driver CUDA 12.6 환경 (RTX 30/40, driver < 580) 에 맞춰
+# PyTorch 공식 CUDA 12.6 wheel index 에서 가져온다. 기본 PyPI 의 cu130 wheel 은
+# driver 580+ 가 필요해 cuda available=False 로 떨어진다.
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 [dependency-groups]
 dev = [

@@ -32,6 +32,14 @@ services:
       DATA_DIR: /app/be/data
       INDOOR_VPS_LOCALIZER_MODE: slam_v3
       PYTHONPATH: /app/src:/app/be:/app
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ports:
       - "8080:8000"
     volumes:
@@ -42,6 +50,8 @@ services:
       - ./alembic:/app/alembic
       - ./alembic.ini:/app/alembic.ini
       - ./scripts:/app/scripts
+      - ./pyproject.toml:/app/pyproject.toml
+      - ./uv.lock:/app/uv.lock
     depends_on:
       db:
         condition: service_healthy
@@ -61,6 +71,14 @@ services:
       STORAGE_ROOT: /app/var/storage
       DATA_DIR: /app/be/data
       PYTHONPATH: /app/src:/app/be:/app
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     volumes:
       - ./var:/app/var
       # Dev: 소스 bind mount → 코드 수정 시 restart 만 (재빌드 불필요)
@@ -69,6 +87,8 @@ services:
       - ./alembic:/app/alembic
       - ./alembic.ini:/app/alembic.ini
       - ./scripts:/app/scripts
+      - ./pyproject.toml:/app/pyproject.toml
+      - ./uv.lock:/app/uv.lock
     depends_on:
       db:
         condition: service_healthy
