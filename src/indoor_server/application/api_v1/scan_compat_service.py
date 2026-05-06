@@ -518,6 +518,34 @@ def _align_and_patch_merged(
         )
     except ValueError as e:
         raise _AlignFailed(f"RANSAC failed: {e}") from e
+
+    # indoor 1층 가정: yaw-only constraint. z translation 과 roll/pitch 가
+    # cross-session loop closure noise 로 인해 mean 이 흔들리면 chunk B 가
+    # floor plane 위로 들려서 floor segmentation 이 못 잡는다.
+    import numpy as np
+
+    yaw = float(np.arctan2(T_AB[1, 0], T_AB[0, 0]))
+    R_yaw = np.array(
+        [
+            [np.cos(yaw), -np.sin(yaw), 0.0],
+            [np.sin(yaw), np.cos(yaw), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    T_AB_planar = np.eye(4, dtype=np.float64)
+    T_AB_planar[:3, :3] = R_yaw
+    T_AB_planar[0, 3] = T_AB[0, 3]
+    T_AB_planar[1, 3] = T_AB[1, 3]
+    T_AB_planar[2, 3] = 0.0
+    logger.info(
+        "stage3 yaw-only constraint applied: yaw=%.2f deg, t=(%.2f, %.2f, 0.0)",
+        np.degrees(yaw),
+        T_AB_planar[0, 3],
+        T_AB_planar[1, 3],
+    )
+    T_AB = T_AB_planar
+
     patch_merged_db(stage2_db, out_db, a_poses, b_poses, T_AB, a_count)
     logger.info(
         "stage3 align: cross_pairs=%d inliers=%d rmse=%.3f T_AB.t=%s",
