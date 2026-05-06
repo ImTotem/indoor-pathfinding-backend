@@ -237,6 +237,11 @@ class ScanCompatService:
             )
 
         # Stage 2: 단독 reprocess 결과들을 -a 로 multi-scan merge.
+        # rtabmap-reprocess 자체 graph optimizer 가 두 ARKit world origin 차이가
+        # 큰 경우 (loop closure translation vs Node.pose 거리 모순) outlier 로
+        # reject 하므로, stage2 결과의 Node.pose 는 두 좌표계가 union 된 채로
+        # 남는다. stage3 에서 RANSAC SE(3) 으로 직접 정렬한다.
+        stage2_db = work_dir / "stage2_unaligned.db"
         logger.info(
             "rtabmap multi-scan merge start (stage2) floor_id=%s sources=%d "
             "merged_scan_id=%s",
@@ -247,9 +252,11 @@ class ScanCompatService:
         try:
             result = await runner.run(
                 sources=single_reprocessed,
-                output_db=merged_db_path,
+                output_db=stage2_db,
                 work_dir=work_dir / "stage2",
-                params=MultiScanReprocessParams(),
+                params=MultiScanReprocessParams(
+                    optimize_max_error=settings.multiscan_merge_optimize_max_error_m,
+                ),
                 timeout_s=900.0,
             )
         except MultiScanRtabmapMergeError as e:
@@ -258,6 +265,37 @@ class ScanCompatService:
                 code="RTABMAP_REPROCESS_FAILED",
                 message=str(e),
             ) from e
+
+        # Stage 3: RANSAC SE(3) align + Node.pose patch.
+        # cross-session loop closure 로 T_AB(B→A) 를 추정하고 chunk B 의 모든
+        # Node.pose 를 chunk A 좌표계로 변환한다. (sprint81/align_and_rebuild_merged
+        # 의 검증된 로직을 재사용 — 정확히 2 source 일 때만 적용.)
+        merged_db_path.parent.mkdir(parents=True, exist_ok=True)
+        if len(single_reprocessed) == 2:
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    _align_and_patch_merged,
+                    stage2_db,
+                    merged_db_path,
+                    single_reprocessed[0].db_path,
+                    single_reprocessed[1].db_path,
+                )
+                logger.info(
+                    "rtabmap multi-scan merge stage3 align done floor_id=%s "
+                    "merged_scan_id=%s",
+                    floor_id,
+                    merged_scan_id,
+                )
+            except _AlignFailed as e:
+                logger.warning(
+                    "stage3 align failed (%s) — fall back to unaligned stage2 db",
+                    e,
+                )
+                shutil.move(str(stage2_db), str(merged_db_path))
+        else:
+            # 3+ sources: align 미지원, stage2 결과 그대로 사용
+            shutil.move(str(stage2_db), str(merged_db_path))
 
         payload_sha256 = await asyncio.get_running_loop().run_in_executor(
             None, _sha256_file, merged_db_path
@@ -438,6 +476,56 @@ def _sha256_file(path: Path) -> str:
 
 class _ReprocessFailed(Exception):
     """single rtabmap-reprocess invocation failed."""
+
+
+class _AlignFailed(Exception):
+    """RANSAC SE(3) alignment failed."""
+
+
+def _align_and_patch_merged(
+    stage2_db: Path,
+    out_db: Path,
+    a_source_db: Path,
+    b_source_db: Path,
+) -> None:
+    """stage2 unaligned merged.db 를 source A/B 의 ARKit pose 와 cross-session
+    loop closure 로 RANSAC 정렬한 결과로 patch 해 out_db 에 저장.
+
+    sprint81/align_and_rebuild_merged 의 함수들을 재사용한다 (이미 검증됨).
+    """
+    from scripts.sprint81.align_and_rebuild_merged import (
+        estimate_T_AB_ransac,
+        load_cross_session_links,
+        load_poses,
+        patch_merged_db,
+    )
+
+    a_poses = load_poses(a_source_db)
+    b_poses = load_poses(b_source_db)
+    if not a_poses or not b_poses:
+        raise _AlignFailed(
+            f"empty pose set (a={len(a_poses)}, b={len(b_poses)})"
+        )
+    a_count = len(a_poses)
+    cross_pairs = load_cross_session_links(stage2_db, a_count)
+    if len(cross_pairs) < 3:
+        raise _AlignFailed(
+            f"insufficient cross-session loop closures: {len(cross_pairs)}"
+        )
+    try:
+        T_AB, rmse, inliers = estimate_T_AB_ransac(
+            a_poses, b_poses, cross_pairs, a_count
+        )
+    except ValueError as e:
+        raise _AlignFailed(f"RANSAC failed: {e}") from e
+    patch_merged_db(stage2_db, out_db, a_poses, b_poses, T_AB, a_count)
+    logger.info(
+        "stage3 align: cross_pairs=%d inliers=%d rmse=%.3f T_AB.t=%s",
+        len(cross_pairs),
+        inliers,
+        rmse,
+        T_AB[:3, 3].round(3).tolist(),
+    )
 
 
 async def _run_rtabmap_reprocess_single(

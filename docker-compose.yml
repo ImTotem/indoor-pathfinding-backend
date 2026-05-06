@@ -35,6 +35,15 @@ services:
       # dev: 데이터 품질 낮은 케이스에서 build 가 통과하도록 quality_gate 완화.
       QUALITY_GATE_MIN_COVERAGE: "0.05"
       QUALITY_GATE_MAX_COMPONENTS: "20"
+      # 격자 기반 dense nav graph 끄고 skeleton 기반 sparse 노드 사용 (예전 동작)
+      DISPLAY_NAVIGATION_GRID_ENABLED: "false"
+      # 두 chunk 모두 floor 영역 살리도록 floor_pointcloud 임계 완화.
+      FLOOR_POINTCLOUD_PIXEL_STRIDE: "2"
+      FLOOR_POINTCLOUD_HEIGHT_TOLERANCE_M: "0.50"
+      FLOOR_POINTCLOUD_MIN_CELL_HITS: "1"
+      # Multi-scan merge: 두 ARKit world 의 origin 차이를 graph optimizer 가
+      # 정렬할 수 있도록 max-error 임계 완화 (default 3m → 50m).
+      MULTISCAN_MERGE_OPTIMIZE_MAX_ERROR_M: "50.0"
     runtime: nvidia
     deploy:
       resources:
@@ -76,6 +85,15 @@ services:
       PYTHONPATH: /app/src:/app/be:/app
       QUALITY_GATE_MIN_COVERAGE: "0.05"
       QUALITY_GATE_MAX_COMPONENTS: "20"
+      # 격자 기반 dense nav graph 끄고 skeleton 기반 sparse 노드 사용 (예전 동작)
+      DISPLAY_NAVIGATION_GRID_ENABLED: "false"
+      # 두 chunk 모두 floor 영역 살리도록 floor_pointcloud 임계 완화.
+      FLOOR_POINTCLOUD_PIXEL_STRIDE: "2"
+      FLOOR_POINTCLOUD_HEIGHT_TOLERANCE_M: "0.50"
+      FLOOR_POINTCLOUD_MIN_CELL_HITS: "1"
+      # Multi-scan merge: 두 ARKit world 의 origin 차이를 graph optimizer 가
+      # 정렬할 수 있도록 max-error 임계 완화 (default 3m → 50m).
+      MULTISCAN_MERGE_OPTIMIZE_MAX_ERROR_M: "50.0"
     runtime: nvidia
     deploy:
       resources:

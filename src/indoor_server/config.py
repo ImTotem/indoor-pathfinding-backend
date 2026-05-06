@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     quality_gate_min_coverage: float = 0.10
     quality_gate_max_components: int = 3
 
+    # rtabmap-reprocess multi-scan merge 의 graph optimizer max-error 임계 (m).
+    # 두 chunk 의 ARKit world origin 차이가 큰 경우 (예: 40m) default 3.0 으로는
+    # cross-session loop closure 가 outlier 로 reject 되어 pose 가 정렬되지 않음.
+    multiscan_merge_optimize_max_error_m: float = 3.0
+
     # ── Sprint 17: 디버그 시각화 덤프 설정 ────────────────────────────────────
 
     # True 이면 워커가 빌드마다 var/debug/{scan_id}/{build_job_id}/ 에 덤프
