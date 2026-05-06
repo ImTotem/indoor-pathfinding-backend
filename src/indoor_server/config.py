@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     # Walkable grid 셀 크기 (미터)
     walkable_grid_cell_m: float = 0.10
 
+    # QualityGate 임계 — dev/시연 환경에서 데이터 품질이 낮을 때 완화 가능.
+    # coverage = walkable cell 수 / grid bbox cell 수 (Sprint 22/63 — bbox 가
+    # trajectory/RTABMap evidence 전체라 실 scan 에서도 0.30 미만이 흔함).
+    # components = skeleton connected component 수.
+    quality_gate_min_coverage: float = 0.10
+    quality_gate_max_components: int = 3
+
     # ── Sprint 17: 디버그 시각화 덤프 설정 ────────────────────────────────────
 
     # True 이면 워커가 빌드마다 var/debug/{scan_id}/{build_job_id}/ 에 덤프

@@ -797,7 +797,12 @@ class BuildPipeline:
 
         # ── QUALITY_GATE ──────────────────────────────────────────────────────
         await progress_sink(BuildStep.QUALITY_GATE, 0.90)
-        gate_step = QualityGateStep()
+        from indoor_server.config import settings as _settings
+
+        gate_step = QualityGateStep(
+            min_coverage=_settings.quality_gate_min_coverage,
+            max_components=_settings.quality_gate_max_components,
+        )
         report = await asyncio.to_thread(gate_step.evaluate, grid, nodes, edges)
 
         from indoor_server.application.building.steps.node_placement import _get_dominant_angle

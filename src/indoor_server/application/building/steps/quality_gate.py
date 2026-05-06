@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # 완전 실패 탐지용 하한으로만 둔다. 지도 품질은 graph connectivity와
 # downstream route 검증에서 다시 확인한다.
 _DEFAULT_MIN_COVERAGE = 0.10
+_DEFAULT_MAX_COMPONENTS = 3
 
 
 class QualityReport(BaseModel):
@@ -30,8 +31,13 @@ class QualityReport(BaseModel):
 
 
 class QualityGateStep:
-    def __init__(self, min_coverage: float = _DEFAULT_MIN_COVERAGE) -> None:
+    def __init__(
+        self,
+        min_coverage: float = _DEFAULT_MIN_COVERAGE,
+        max_components: int = _DEFAULT_MAX_COMPONENTS,
+    ) -> None:
         self._min_coverage = min_coverage
+        self._max_components = max_components
 
     def evaluate(
         self,
@@ -60,7 +66,7 @@ class QualityGateStep:
         # Sprint 25: components 1개 강제는 너무 엄격. POI projection이 추가하는
         # spur 노드가 main skeleton과 분리될 수 있어 ≤ 3까지 허용.
         # 실제 navigation에서 끊긴 component는 /route 422 PATH_NOT_FOUND로 처리됨.
-        if components > 3:
+        if components > self._max_components:
             return QualityReport(
                 walkable_coverage=coverage,
                 connected_components=components,
