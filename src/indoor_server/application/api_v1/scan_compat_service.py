@@ -311,6 +311,17 @@ class ScanCompatService:
                 device_info=None,
             )
         )
+
+        # stage4: build pipeline 의 POI projection step 은 active scan_id 로만
+        # keyframe_meta / poi_mark / poi_canonical 을 lookup 한다. chunk A 의
+        # 메타데이터 row 들을 merged_scan_id 로 복사해 POI 가 살아남게 한다.
+        # (chunk B 는 align T_AB 적용이 필요해 다음 phase 에서 일반화. 현재는
+        # chunk B 에 POI 가 없는 케이스만 정상 처리.)
+        if sources:
+            await self._copy_anchor_metadata_to_merged(
+                anchor_scan_id=str(sources[0].scan_id),
+                merged_scan_id=str(merged_scan_id),
+            )
         await self._session.execute(
             sa.update(t.floor_scan)
             .where(t.floor_scan.c.floor_id == str(floor_id))
@@ -452,6 +463,135 @@ class ScanCompatService:
         if row is None:
             raise V1ServiceError(404, "CHUNK_NOT_FOUND", "scan chunk not found")
         return row
+
+    async def _copy_anchor_metadata_to_merged(
+        self, *, anchor_scan_id: str, merged_scan_id: str
+    ) -> None:
+        """anchor chunk 의 keyframe_meta / poi_mark / poi_photo / poi_canonical
+        을 merged scan_id 로 복사 → build pipeline 의 POI projection 이 active
+        scan_id (=merged) 로 lookup 시 그대로 보이도록 한다.
+
+        anchor 는 stage3 align 의 reference 좌표계라 transform = identity.
+        """
+        # scan_session 부터 — keyframe_meta 가 scan_session.scan_id 로 FK
+        await self._session.execute(
+            sa.text(
+                "INSERT INTO scan_session "
+                "(scan_id, started_at, ended_at, device_model, app_version, "
+                " state, keyframe_count, notes) "
+                "SELECT :merged_id, started_at, ended_at, device_model, "
+                "       app_version, state, keyframe_count, notes "
+                "FROM scan_session WHERE scan_id = :anchor_id"
+            ),
+            {"merged_id": merged_scan_id, "anchor_id": anchor_scan_id},
+        )
+        # keyframe_meta 복사 (PK = (scan_id, seq), 다른 scan_id 면 충돌 없음)
+        await self._session.execute(
+            sa.text(
+                "INSERT INTO keyframe_meta "
+                "(scan_id, seq, captured_at, image_path, pose_matrix, "
+                " tx, ty, tz, tracking_state, rtabmap_node_id) "
+                "SELECT :merged_id, seq, captured_at, image_path, pose_matrix, "
+                "       tx, ty, tz, tracking_state, rtabmap_node_id "
+                "FROM keyframe_meta WHERE scan_id = :anchor_id"
+            ),
+            {"merged_id": merged_scan_id, "anchor_id": anchor_scan_id},
+        )
+        # poi_mark 복사 (id 는 autoincrement). old_id → new_id 매핑 필요해
+        # 행 단위로 INSERT … RETURNING.
+        old_pois = (
+            await self._session.execute(
+                sa.text(
+                    "SELECT id, keyframe_seq, created_at, pose_matrix, "
+                    "tx, ty, tz, track_id, label, source, canonical_id "
+                    "FROM poi_mark WHERE scan_id = :anchor_id ORDER BY id"
+                ),
+                {"anchor_id": anchor_scan_id},
+            )
+        ).fetchall()
+        id_map: dict[int, int] = {}
+        for row in old_pois:
+            new_id = (
+                await self._session.execute(
+                    sa.text(
+                        "INSERT INTO poi_mark "
+                        "(scan_id, keyframe_seq, created_at, pose_matrix, "
+                        " tx, ty, tz, track_id, label, source, canonical_id) "
+                        "VALUES (:scan_id, :seq, :ca, :pm, :tx, :ty, :tz, "
+                        "        :tk, :lbl, :src, :cid) RETURNING id"
+                    ),
+                    {
+                        "scan_id": merged_scan_id,
+                        "seq": row.keyframe_seq,
+                        "ca": row.created_at,
+                        "pm": row.pose_matrix,
+                        "tx": row.tx,
+                        "ty": row.ty,
+                        "tz": row.tz,
+                        "tk": row.track_id,
+                        "lbl": row.label,
+                        "src": row.source,
+                        "cid": row.canonical_id,
+                    },
+                )
+            ).scalar_one()
+            id_map[int(row.id)] = int(new_id)
+        # poi_photo 복사 (poi_mark_id 를 id_map 으로 remap)
+        if id_map:
+            old_photos = (
+                await self._session.execute(
+                    sa.text(
+                        "SELECT poi_mark_id, keyframe_seq, captured_at, "
+                        "bbox_x, bbox_y, bbox_w, bbox_h, class_name, "
+                        "confidence, image_path, image_blob "
+                        "FROM poi_photo WHERE scan_id = :anchor_id"
+                    ),
+                    {"anchor_id": anchor_scan_id},
+                )
+            ).fetchall()
+            for row in old_photos:
+                if int(row.poi_mark_id) not in id_map:
+                    continue
+                await self._session.execute(
+                    sa.text(
+                        "INSERT INTO poi_photo "
+                        "(poi_mark_id, scan_id, keyframe_seq, captured_at, "
+                        " bbox_x, bbox_y, bbox_w, bbox_h, class_name, "
+                        " confidence, image_path, image_blob) "
+                        "VALUES (:pid, :scan_id, :seq, :ca, :bx, :by, :bw, "
+                        "        :bh, :cn, :conf, :ip, :ib)"
+                    ),
+                    {
+                        "pid": id_map[int(row.poi_mark_id)],
+                        "scan_id": merged_scan_id,
+                        "seq": row.keyframe_seq,
+                        "ca": row.captured_at,
+                        "bx": row.bbox_x,
+                        "by": row.bbox_y,
+                        "bw": row.bbox_w,
+                        "bh": row.bbox_h,
+                        "cn": row.class_name,
+                        "conf": row.confidence,
+                        "ip": row.image_path,
+                        "ib": row.image_blob,
+                    },
+                )
+        # poi_canonical: scan_id 를 merged 로 update
+        await self._session.execute(
+            sa.text(
+                "UPDATE poi_canonical SET scan_id = :merged_id "
+                "WHERE scan_id = :anchor_id"
+            ),
+            {"merged_id": merged_scan_id, "anchor_id": anchor_scan_id},
+        )
+        logger.info(
+            "stage4 metadata copy done anchor=%s → merged=%s "
+            "keyframes_copied (via INSERT SELECT) poi_marks=%d photos=%d",
+            anchor_scan_id,
+            merged_scan_id,
+            len(old_pois),
+            len(id_map),
+        )
 
     async def _merge_status_for_scan(self, scan_id: str) -> str:
         latest = await BuildJobRepository(self._session).get_latest(scan_id)
