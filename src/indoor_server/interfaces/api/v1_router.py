@@ -513,6 +513,18 @@ async def post_localize(
             sizes,
             sum(sizes),
         )
+        # Query image debug dump
+        try:
+            import datetime as _dt
+            from indoor_server.config import settings as _settings
+            dump_dir = _settings.storage_root / "debug" / "localize" / str(building_id)
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            ts = _dt.datetime.now(_dt.UTC).strftime("%Y%m%d_%H%M%S_%f")
+            for i, b in enumerate(image_bytes):
+                (dump_dir / f"{ts}_{i:02d}.jpg").write_bytes(b)
+            logger.info("localize query dump: %s/ %d images", dump_dir, len(image_bytes))
+        except Exception as _dump_exc:
+            logger.warning("localize query dump 실패: %s", _dump_exc)
         response = await LocalizationAdapter(session).localize(
             building_id=building_id,
             images=image_bytes,

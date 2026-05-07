@@ -181,7 +181,7 @@ def step_build_navgraph(
     rtabmap_links = load_rtabmap_links(merged_db)
     logger.info("RTABMap links loaded: %d", len(rtabmap_links))
 
-    nodes = downsample_nodes(xy, map_id, pose_ids, polygon, cell_m=2.0)
+    nodes = downsample_nodes(xy, map_id, pose_ids, polygon, cell_m=0.5)
     logger.info("Nav nodes (pre-component): %d", len(nodes))
 
     edges = build_edges(nodes, polygon, rtabmap_links, edge_max_m=3.0)

@@ -711,6 +711,83 @@ class BuildService:
         # merged DB 경로: 단일 scan 이면 zip 내 rtabmap.db 를 그대로 사용
         merged_db = settings.storage_root / "scans" / scan_id / "rtabmap.db"
 
+        # 빈 rtabmap.db (ARKit 클라가 raw 만 보낸 경우) 감지 시 mp4 + poses.bin 으로 seed
+        from indoor_server.application.building.rtabmap_seeder import (
+            is_empty_rtabmap_db,
+            seed_rtabmap_db_from_video,
+        )
+        if is_empty_rtabmap_db(merged_db):
+            scan_root = settings.storage_root / "scans" / scan_id
+            logger.info(
+                "rtabmap.db is empty — seeding from mp4+poses scan_id=%s", scan_id,
+            )
+            try:
+                node_count = await asyncio.to_thread(
+                    seed_rtabmap_db_from_video,
+                    scan_root=scan_root,
+                    output_db=merged_db,
+                )
+                logger.info(
+                    "rtabmap_seeder: success scan_id=%s nodes=%d", scan_id, node_count,
+                )
+                # seed 후 reprocess 로 Word/Feature/GlobalDesc 채움
+                from indoor_server.application.api_v1.scan_compat_service import (
+                    _run_rtabmap_reprocess_single,
+                )
+                seeded_db = merged_db
+                reprocessed_db = merged_db.with_suffix(".reprocessed.db")
+                await _run_rtabmap_reprocess_single(
+                    binary_path="rtabmap-reprocess",
+                    input_db=seeded_db,
+                    output_db=reprocessed_db,
+                    timeout_s=600.0,
+                )
+                # 원본 자리에 reprocess 결과 덮어쓰기 (rtab-map graph optimization
+                # 결과 pose 를 그대로 사용 — frame 일관성 보장)
+                seeded_db.unlink()
+                reprocessed_db.rename(seeded_db)
+                logger.info(
+                    "rtabmap-reprocess: done scan_id=%s db=%s", scan_id, seeded_db,
+                )
+                # Seed + reprocess 가 Node 를 채웠으므로 keyframe_meta.rtabmap_node_id
+                # 를 위치 기반 매칭으로 backfill (Node.stamp 가 mp4 relative 라 기존
+                # stamp-based backfill 은 매칭 안 됨).
+                from indoor_server.application.building.rtabmap_seeder import (
+                    backfill_keyframe_node_ids_by_position,
+                )
+                try:
+                    async with AsyncSession(self._engine) as session:
+                        async with session.begin():
+                            stats = await backfill_keyframe_node_ids_by_position(
+                                session=session,
+                                scan_id=scan_id,
+                                rtabmap_db_path=seeded_db,
+                            )
+                    logger.info(
+                        "post-seed position backfill scan_id=%s stats=%s",
+                        scan_id, stats,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "post-seed position backfill 실패 scan_id=%s err=%s",
+                        scan_id, exc,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "rtabmap_seeder: failed scan_id=%s err=%s", scan_id, exc,
+                )
+                async with AsyncSession(self._engine) as session:
+                    async with session.begin():
+                        await BuildJobRepository(session).update_state(
+                            build_job_id=build_job_id,
+                            state=BuildState.FAILED,
+                            step=BuildStep.QUALITY_GATE,
+                            progress=0.2,
+                            failure_reason=BuildFailureReason.INTERNAL,
+                            failure_detail={"error": f"rtabmap_seed_failed: {exc}"},
+                        )
+                raise
+
         # baseline polygon: dense_video_floor evidence 에서 가져옴 (없으면 None)
         baseline = self._dense_video_floor_baseline(scan_id, build_job_id)
 
@@ -911,6 +988,79 @@ class BuildService:
                     _poi_err,
                 )
 
+        # branch_mark: 사용자가 찍은 분기점 → graph 의 junction 노드로 추가.
+        # 좌표는 ARKit Y-up frame 이므로 transform 적용 (POI 와 동일 방식).
+        try:
+            async with AsyncSession(self._engine) as _br_session:
+                from indoor_server.infrastructure.db import tables as _t
+                import sqlalchemy as _sa
+                br_rows = (
+                    await _br_session.execute(
+                        _sa.select(
+                            _t.branch_mark.c.id,
+                            _t.branch_mark.c.tx,
+                            _t.branch_mark.c.ty,
+                            _t.branch_mark.c.tz,
+                        ).where(_t.branch_mark.c.scan_id == scan_id)
+                    )
+                ).fetchall()
+            if br_rows and pois:
+                # tf 는 위 POI 처리에서 만든 transform 재사용
+                from indoor_server.domain.building.enums import NodeType as _NT
+                br_count = 0
+                for br in br_rows:
+                    arkit_xyz = (float(br.tx), float(br.ty), float(br.tz))
+                    if tf is not None and tf.confidence == "high":
+                        wx, wy, wz = tf.apply(arkit_xyz)
+                    else:
+                        wx, wy, wz = arkit_xyz
+                    br_node = MapNodeVO(
+                        node_id=uuid5(job_uuid, f"branch-mark:{int(br.id)}"),
+                        scan_id=scan_uuid,
+                        build_job_id=job_uuid,
+                        node_type=_NT.JUNCTION,
+                        x=float(wx), y=float(wy), z=float(wz),
+                        label=None,
+                        source_ref={
+                            "role": "branch_mark",
+                            "branch_mark_id": int(br.id),
+                            "raw_arkit_xyz": list(arkit_xyz),
+                        },
+                    )
+                    map_nodes.append(br_node)
+                    # 가장 가까운 corridor/junction 노드와 spur edge
+                    target = min(
+                        (n for n in map_nodes if n.node_type in (
+                            NodeType.CORRIDOR, NodeType.POI_ATTACH, NodeType.JUNCTION
+                        ) and n.node_id != br_node.node_id),
+                        key=lambda n: math.hypot(n.x - br_node.x, n.y - br_node.y),
+                        default=None,
+                    )
+                    if target is not None:
+                        d = math.hypot(target.x - br_node.x, target.y - br_node.y)
+                        if d > 0.001:
+                            map_edges.append(MapEdgeVO(
+                                edge_id=uuid5(job_uuid, f"branch-edge:{int(br.id)}"),
+                                scan_id=scan_uuid,
+                                build_job_id=job_uuid,
+                                from_node_id=br_node.node_id,
+                                to_node_id=target.node_id,
+                                edge_type=EdgeType.SKELETON,
+                                polyline=[(br_node.x, br_node.y, br_node.z),
+                                          (target.x, target.y, target.z)],
+                                length_m=d,
+                            ))
+                    br_count += 1
+                logger.info(
+                    "video_mode_pipeline: branch nodes 추가 count=%d scan_id=%s",
+                    br_count, scan_id,
+                )
+        except Exception as _br_err:
+            logger.warning(
+                "video_mode_pipeline: branch_mark 통합 실패 scan_id=%s err=%s",
+                scan_id, _br_err,
+            )
+
         # A-6: interfloor_mark connector nodes 통합 (기존 경로와 동일 헬퍼 사용)
         if interfloor_marks:
             map_nodes, map_edges = _append_interfloor_connector_nodes(
@@ -986,6 +1136,42 @@ class BuildService:
             "video_mode_pipeline: SUCCEEDED scan_id=%s nodes=%d edges=%d",
             scan_id, len(map_nodes), len(map_edges),
         )
+
+        # Server 의 SuperPoint cache 를 미리 채움 (cold-start 제거).
+        # fire-and-forget — server 가 background thread 로 indexing.
+        try:
+            await self._warmup_superpoint(
+                scan_id=scan_id,
+                rtabmap_db_path=settings.storage_root / "scans" / scan_id / "rtabmap.db",
+            )
+        except Exception as exc:
+            logger.warning("superpoint warmup trigger 실패 scan_id=%s err=%s", scan_id, exc)
+
+    async def _warmup_superpoint(self, *, scan_id: str, rtabmap_db_path: Path) -> None:
+        """Build 완료 후 server 의 SuperPoint cache 를 preload."""
+        async with AsyncSession(self._engine) as session:
+            # scan_id → floor_id (warmup 시 SuperPoint engine 의 map_id 가 floor_id 임)
+            row = (
+                await session.execute(
+                    sa.select(t.floor_scan.c.floor_id)
+                    .where(t.floor_scan.c.scan_id == scan_id)
+                    .where(t.floor_scan.c.active == sa.true())
+                    .limit(1)
+                )
+            ).first()
+        if row is None:
+            return
+        floor_id = str(row.floor_id)
+        # server 컨테이너 internal port 8000 (compose service name=server)
+        import httpx as _httpx
+        url = "http://server:8000/admin/superpoint/warmup"
+        payload = {"map_id": floor_id, "db_path": str(rtabmap_db_path)}
+        async with _httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload)
+            logger.info(
+                "superpoint warmup queued floor_id=%s status=%d",
+                floor_id, resp.status_code,
+            )
 
     def _dense_video_floor_baseline(self, scan_id: str, build_job_id: str) -> Path | None:
         """dense_video_floor evidence 에서 baseline polygon 경로를 반환. 없으면 None."""

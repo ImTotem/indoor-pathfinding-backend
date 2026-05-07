@@ -336,15 +336,15 @@ def assign_components(
                 cross_session_bridge_m,
             )
 
-    # Prune noise components (≤ 2 nodes)
+    # Prune noise components (≤ 1 node = isolated only) — 짧은 스캔 호환
     if True:
-        noise_nodes = {i for i, c in enumerate(comp_list) if comp_sizes.get(c, 0) <= 2}
+        noise_nodes = {i for i, c in enumerate(comp_list) if comp_sizes.get(c, 0) <= 1}
         # Recount with updated comp_list from nodes
         final_comp_list = [n.component_id for n in nodes]
         final_comp_sizes = Counter(final_comp_list)
-        noise_nodes_final = {i for i, c in enumerate(final_comp_list) if final_comp_sizes.get(c, 0) <= 2}
+        noise_nodes_final = {i for i, c in enumerate(final_comp_list) if final_comp_sizes.get(c, 0) <= 1}
         if noise_nodes_final:
-            logger.info("Pruning %d noise nodes (component size ≤ 2)", len(noise_nodes_final))
+            logger.info("Pruning %d noise nodes (component size ≤ 1)", len(noise_nodes_final))
             keep_ids = {nodes[i].node_id for i in range(len(nodes)) if i not in noise_nodes_final}
             for n in nodes:
                 if n.node_id not in keep_ids:

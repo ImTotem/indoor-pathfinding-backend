@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # default thresholds (config 에서 오버라이드 가능)
 DEFAULT_PAIR_COUNT_MIN_FOR_HIGH = 3
-DEFAULT_RESIDUAL_RMS_MAX_M = 0.30
+DEFAULT_RESIDUAL_RMS_MAX_M = 0.50
 DEFAULT_PLANAR_Z_RANGE_M = 0.05  # z range < 0.05m → planar trajectory
 
 

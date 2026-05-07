@@ -73,6 +73,30 @@ router = APIRouter()
 _store = LocalFileStorage(settings.storage_root)
 
 
+# ── /admin/superpoint/warmup ─────────────────────────────────────────────────
+# Build 완료 후 worker 가 fire-and-forget 으로 호출.
+# server 의 SuperPointMapManager 캐시를 미리 채워 첫 localize 의 cold-start 제거.
+@router.post("/admin/superpoint/warmup", tags=["admin"])
+async def superpoint_warmup(payload: dict) -> dict:
+    import asyncio as _asyncio
+    map_id = str(payload.get("map_id") or "")
+    db_path = str(payload.get("db_path") or "")
+    if not map_id or not db_path:
+        raise HTTPException(status_code=400, detail="map_id and db_path required")
+
+    def _do_warmup() -> None:
+        try:
+            from be.slam_engines.superpoint.map_manager import SuperPointMapManager
+            SuperPointMapManager().get_or_load(map_id, db_path)
+            logger.info("[warmup] SuperPoint cache ready map_id=%s", map_id)
+        except Exception as exc:
+            logger.warning("[warmup] failed map_id=%s err=%s", map_id, exc)
+
+    # background thread — 응답은 즉시 (큰 map 은 1~3분 걸림)
+    _asyncio.get_event_loop().run_in_executor(None, _do_warmup)
+    return {"queued": True, "map_id": map_id}
+
+
 # ── /scan/upload ──────────────────────────────────────────────────────────────
 
 

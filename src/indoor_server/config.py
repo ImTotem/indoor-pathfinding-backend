@@ -273,7 +273,7 @@ class Settings(BaseSettings):
     display_navigation_grid_poi_attach_k: int = 4
 
     # ── V1 VPS adapter boundary ─────────────────────────────────────────────
-    # mock: CI/dev fallback. slam_v3: use legacy be `/api/slam/v3/localize`
+    # mock: CI/dev fallback. slam_v3: use main `/api/slam/v3/localize`
     # implementation against v2 scan_ingest/floor_scan DB state.
     vps_localizer_mode: str = Field(
         default="mock",

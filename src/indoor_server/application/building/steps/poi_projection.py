@@ -170,15 +170,25 @@ class POIProjectionStep:
             bpz = wz  # floor plane 기준
 
             if best_dist < _MIN_EDGE_SPLIT_DIST:
-                # POI가 edge 위에 거의 있음 → split 없이 spur만
-                attach_node = MapNodeVO(
-                    node_id=uuid4(),
-                    scan_id=self._scan_id,
-                    build_job_id=self._build_job_id,
-                    node_type=NodeType.POI_ATTACH,
-                    x=bpx, y=bpy, z=bpz,
+                # POI가 edge 위에 거의 있음 → 별도 attach 노드 만들지 말고
+                # best_edge 의 더 가까운 끝 노드를 attach 로 사용 (connectivity 보장)
+                attach_node_id = (
+                    best_edge.from_node_id if best_t < 0.5 else best_edge.to_node_id
                 )
-                extra_nodes.append(attach_node)
+                attach_node = next(
+                    (n for n in nodes if n.node_id == attach_node_id),
+                    None,
+                )
+                if attach_node is None:
+                    # 매우 드문 경우 — fallback: 별도 attach 만들고 spur 만
+                    attach_node = MapNodeVO(
+                        node_id=uuid4(),
+                        scan_id=self._scan_id,
+                        build_job_id=self._build_job_id,
+                        node_type=NodeType.POI_ATTACH,
+                        x=bpx, y=bpy, z=bpz,
+                    )
+                    extra_nodes.append(attach_node)
             else:
                 # edge를 projection 지점에서 split
                 attach_node = MapNodeVO(

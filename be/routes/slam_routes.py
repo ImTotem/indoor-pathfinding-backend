@@ -349,6 +349,22 @@ async def _localize_uploads(
 ) -> SLAMLocalizeResponse:
     resolved_building_id = _coerce_building_id(building_id, map_id)
     image_bytes_list = await _read_upload_images(images)
+
+    # Query image debug dump (사용자 앱 메인 endpoint 의 query 보존)
+    try:
+        import datetime as _dt
+        from pathlib import Path as _Path
+        import os as _os
+        storage_root = _Path(_os.environ.get("INDOOR_STORAGE_ROOT", "/app/var/storage"))
+        dump_dir = storage_root / "debug" / "localize" / str(resolved_building_id)
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now(_dt.UTC).strftime("%Y%m%d_%H%M%S_%f")
+        for i, b in enumerate(image_bytes_list):
+            (dump_dir / f"{ts}_{i:02d}.jpg").write_bytes(b)
+        logger.info("v3 localize query dump: %s/ %d images", dump_dir, len(image_bytes_list))
+    except Exception as _dump_exc:
+        logger.warning("v3 localize query dump 실패: %s", _dump_exc)
+
     return await _localize_bytes(
         building_id=resolved_building_id,
         image_bytes_list=image_bytes_list,
@@ -453,7 +469,10 @@ async def _localize_bytes(
     if not valid:
         raise HTTPException(status_code=503, detail="Localization failed on all floors")
 
-    best = max(valid, key=lambda r: (r["confidence"], r.get("num_matches", 0)))
+    # 우선순위: inlier 절대값 > confidence (작은 graph 의 비율 기반 false positive 방지).
+    # 작은 graph (예: 4 keyframe) 가 inliers 6 인데도 confidence 비율이 높아 큰 graph 보다
+    # 잘못 선택되는 문제 — 큰 graph 의 inliers 많은 매칭이 더 신뢰할 만.
+    best = max(valid, key=lambda r: (r.get("num_matches", 0), r["confidence"]))
 
     logger.info(
         f"[SLAM-LOCALIZE] Best: floor={best.get('floor_name')}, "

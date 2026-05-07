@@ -112,6 +112,27 @@ def _load_gray_float(conn: sqlite3.Connection, node_id: int) -> Optional[np.ndar
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
 
 
+def _parse_calibration_K_and_local(blob: bytes) -> Tuple[np.ndarray, np.ndarray]:
+    """RTABMap 0.23.x calibration BLOB (164B) → (K 3x3, local_transform 3x4).
+
+    Layout (write_rtabmap_db 와 동일):
+      [44..115]  9x float64 = K matrix (row-major)
+      [116..163] 12x float32 = local_transform (row-major)
+    """
+    import struct
+    if len(blob) < 116:
+        raise ValueError(f"calibration blob too short: {len(blob)} bytes")
+    K_vals = struct.unpack('<9d', blob[44:44 + 72])
+    K = np.array(K_vals, dtype=np.float64).reshape(3, 3)
+    if len(blob) >= 164:
+        lt_vals = struct.unpack('<12f', blob[116:116 + 48])
+        local_transform = np.array(lt_vals, dtype=np.float64).reshape(3, 4)
+    else:
+        local_transform = np.zeros((3, 4))
+        local_transform[:3, :3] = np.eye(3)
+    return K, local_transform
+
+
 # ---------------------------------------------------------------------------
 # Loaded map
 # ---------------------------------------------------------------------------
@@ -199,6 +220,141 @@ class SuperPointLoadedMap:
             f"{len(self.node_ids)} frames, {n_with_3d} with 3D coverage"
         )
 
+        # Fallback: RTAB-Map Feature 에 depth 가 없어 3D coverage 가 0 인 경우
+        # 이웃 keyframe pair multi-view triangulation 으로 world 3D 추정
+        if n_with_3d == 0 and len(self.node_ids) >= 2:
+            logger.info(
+                "[SuperPoint] No depth coverage from RTAB-Map — running multi-view triangulation"
+            )
+            t1 = time.time()
+            self._triangulate_via_multi_view()
+            n_with_3d = sum(
+                1 for v in self.keyframe_world3d.values()
+                if not np.all(np.isnan(v))
+            )
+            logger.info(
+                f"[SuperPoint] Triangulation done in {time.time()-t1:.1f}s: "
+                f"{n_with_3d}/{len(self.node_ids)} frames with 3D coverage"
+            )
+
+    def _triangulate_via_multi_view(
+        self,
+        neighbor_offsets: tuple[int, ...] = (-2, -1, 1, 2),
+        min_matches: int = 12,
+        min_depth_m: float = 0.2,
+        max_depth_m: float = 30.0,
+    ) -> None:
+        """이웃 keyframe pair LightGlue 매칭 + cv2.triangulatePoints → world 3D.
+
+        Node.pose 는 base_link → world (3x4). Calibration BLOB 의 local_transform
+        은 base_link → camera_optical 변환. P = K @ T_world_to_optical.
+        """
+        from lightglue import LightGlue
+        from lightglue.utils import rbd
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            transforms = _parse_node_transforms(conn)  # base→world (3x4)
+            # K + local_transform 추출 (모든 keyframe 동일 가정 — 첫 keyframe 사용)
+            calib_row = conn.execute(
+                "SELECT calibration FROM Data WHERE id = ? LIMIT 1",
+                (self.node_ids[0],),
+            ).fetchone()
+            if not calib_row or not calib_row[0]:
+                logger.warning("[SuperPoint] No calibration in Data — skipping triangulation")
+                return
+            K, local_transform = _parse_calibration_K_and_local(bytes(calib_row[0]))
+            C = local_transform[:3, :3]  # base → optical (3x3)
+        finally:
+            conn.close()
+
+        matcher = LightGlue(features='superpoint').eval().to(self.device)
+
+        # 누적 buffer: keyframe id → kp index → list of triangulated 3D points
+        accum: Dict[int, list[list[np.ndarray]]] = {}
+        for nid in self.node_ids:
+            kp_count = self.keyframe_feats[nid]['keypoints'].shape[1]
+            accum[nid] = [[] for _ in range(kp_count)]
+
+        n = len(self.node_ids)
+        pair_processed = 0
+        with torch.no_grad():
+            for i in range(n):
+                nid_i = self.node_ids[i]
+                if nid_i not in transforms:
+                    continue
+                T_bi_w = np.eye(4, dtype=np.float64)
+                T_bi_w[:3, :] = transforms[nid_i]
+                T_w_bi = np.linalg.inv(T_bi_w)
+                # world → optical_i
+                R_wo_i = C @ T_w_bi[:3, :3]
+                t_wo_i = C @ T_w_bi[:3, 3]
+                P_i = K @ np.hstack([R_wo_i, t_wo_i.reshape(3, 1)])
+
+                feats_i = {k: v.to(self.device) for k, v in self.keyframe_feats[nid_i].items()}
+                kps_i_np = self.keyframe_feats[nid_i]['keypoints'][0].cpu().numpy()
+
+                for offset in neighbor_offsets:
+                    j = i + offset
+                    if j < 0 or j >= n:
+                        continue
+                    nid_j = self.node_ids[j]
+                    if nid_j not in transforms:
+                        continue
+                    T_bj_w = np.eye(4, dtype=np.float64)
+                    T_bj_w[:3, :] = transforms[nid_j]
+                    T_w_bj = np.linalg.inv(T_bj_w)
+                    R_wo_j = C @ T_w_bj[:3, :3]
+                    t_wo_j = C @ T_w_bj[:3, 3]
+                    P_j = K @ np.hstack([R_wo_j, t_wo_j.reshape(3, 1)])
+
+                    feats_j = {k: v.to(self.device) for k, v in self.keyframe_feats[nid_j].items()}
+                    kps_j_np = self.keyframe_feats[nid_j]['keypoints'][0].cpu().numpy()
+
+                    result = matcher({'image0': feats_i, 'image1': feats_j})
+                    matches = rbd(result)['matches'].cpu().numpy()
+                    if len(matches) < min_matches:
+                        continue
+
+                    pts_i = kps_i_np[matches[:, 0]].T.astype(np.float64)  # (2, M)
+                    pts_j = kps_j_np[matches[:, 1]].T.astype(np.float64)
+
+                    X_h = cv2.triangulatePoints(P_i, P_j, pts_i, pts_j)  # (4, M)
+                    valid_w = np.abs(X_h[3]) > 1e-9
+                    X = (X_h[:3, valid_w] / X_h[3, valid_w]).T  # (M', 3) world
+
+                    if len(X) == 0:
+                        continue
+
+                    # 두 카메라 모두에서 positive depth & in-range
+                    Xi_opt = (R_wo_i @ X.T).T + t_wo_i  # optical_i frame
+                    Xj_opt = (R_wo_j @ X.T).T + t_wo_j
+                    di = Xi_opt[:, 2]
+                    dj = Xj_opt[:, 2]
+                    in_range = (
+                        (di > min_depth_m) & (di < max_depth_m) &
+                        (dj > min_depth_m) & (dj < max_depth_m)
+                    )
+
+                    matches_valid_idx = np.flatnonzero(valid_w)[in_range]
+                    X_kept = X[in_range]
+                    for k_idx, mi in zip(matches[matches_valid_idx, 0], X_kept):
+                        accum[nid_i][int(k_idx)].append(mi.astype(np.float32))
+                    pair_processed += 1
+
+        # 각 keyframe 의 kp 별 median (또는 평균) 으로 final world 3D
+        for nid in self.node_ids:
+            kp_count = len(accum[nid])
+            arr = np.full((kp_count, 3), np.nan, dtype=np.float32)
+            for kp_idx, points in enumerate(accum[nid]):
+                if points:
+                    arr[kp_idx] = np.median(np.stack(points, axis=0), axis=0)
+            self.keyframe_world3d[nid] = arr
+
+        logger.info(
+            f"[SuperPoint] triangulation: pairs={pair_processed} (neighbor offsets={neighbor_offsets})"
+        )
+
     def top_k_candidates(
         self, q_desc_mean: torch.Tensor, k: int = TOP_K
     ) -> List[int]:
@@ -232,8 +388,17 @@ class SuperPointMapManager:
                     inst._device = torch.device(
                         'cuda' if torch.cuda.is_available() else 'cpu'
                     )
+                    # map_id 별 indexing 동시 진행 방지 lock
+                    inst._build_locks: Dict[str, threading.Lock] = {}
+                    inst._build_locks_guard = threading.Lock()
                     cls._instance = inst
         return cls._instance
+
+    def _get_build_lock(self, map_id: str) -> threading.Lock:
+        with self._build_locks_guard:
+            if map_id not in self._build_locks:
+                self._build_locks[map_id] = threading.Lock()
+            return self._build_locks[map_id]
 
     @property
     def device(self) -> torch.device:
@@ -242,14 +407,54 @@ class SuperPointMapManager:
     def get_or_load(
         self, map_id: str, db_path: Optional[str] = None
     ) -> SuperPointLoadedMap:
+        # active scan 이 바뀌었거나 db 파일 mtime 이 바뀐 경우 캐시 invalidate
         if map_id in self._maps:
-            self._maps.move_to_end(map_id)
-            return self._maps[map_id]
+            cached = self._maps[map_id]
+            try:
+                cached_mtime = getattr(cached, "_db_mtime", None)
+                if db_path is not None and str(cached.db_path) != str(db_path):
+                    logger.info(
+                        f"[SuperPoint] map '{map_id}' db_path changed "
+                        f"({cached.db_path} → {db_path}) — invalidating cache"
+                    )
+                    del self._maps[map_id]
+                else:
+                    import os
+                    current_mtime = os.path.getmtime(cached.db_path) if cached.db_path else None
+                    if cached_mtime is not None and current_mtime != cached_mtime:
+                        logger.info(
+                            f"[SuperPoint] map '{map_id}' db file modified "
+                            f"(mtime {cached_mtime} → {current_mtime}) — invalidating cache"
+                        )
+                        del self._maps[map_id]
+                    else:
+                        self._maps.move_to_end(map_id)
+                        return cached
+            except Exception as exc:
+                logger.warning(f"[SuperPoint] cache validation failed: {exc} — invalidating")
+                self._maps.pop(map_id, None)
+
         if db_path is None:
             raise ValueError(f"Map '{map_id}' not cached and no db_path provided")
-        m = SuperPointLoadedMap(map_id, db_path, self._device)
-        self._maps[map_id] = m
-        while len(self._maps) > MAX_CACHED_MAPS:
-            evicted, _ = self._maps.popitem(last=False)
-            logger.info(f"[SuperPoint] Evicted map '{evicted}' from cache")
-        return m
+
+        # map_id 별 lock — 동시 요청 시 첫 thread 만 indexing, 나머지는 대기 후 cache hit
+        build_lock = self._get_build_lock(map_id)
+        with build_lock:
+            # double-check: lock 대기 중 다른 thread 가 이미 indexing 했을 수 있음
+            if map_id in self._maps:
+                cached = self._maps[map_id]
+                if str(cached.db_path) == str(db_path):
+                    self._maps.move_to_end(map_id)
+                    return cached
+
+            m = SuperPointLoadedMap(map_id, db_path, self._device)
+            try:
+                import os
+                m._db_mtime = os.path.getmtime(db_path)
+            except Exception:
+                m._db_mtime = None
+            self._maps[map_id] = m
+            while len(self._maps) > MAX_CACHED_MAPS:
+                evicted, _ = self._maps.popitem(last=False)
+                logger.info(f"[SuperPoint] Evicted map '{evicted}' from cache")
+            return m

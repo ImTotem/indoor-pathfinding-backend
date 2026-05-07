@@ -44,7 +44,7 @@ OPENAPI_TAGS = [
         "name": "사용자 앱 API",
         "description": "사용자 앱이 직접 호출하는 API: 건물조회, v3 localize, POI 조회, 경로 탐색",
     },
-    {"name": "SLAM - 처리", "description": "legacy `/api/slam` 처리, 상태, 헬스, 메타데이터 API"},
+    {"name": "SLAM - 처리", "description": "`/api/slam` 처리, 상태, 헬스, 메타데이터 API"},
     {"name": "SLAM - 위치추정", "description": "이미지 파일 업로드 기반 VPS/SLAM 위치 추정 API"},
     {"name": "SLAM - 디버그", "description": "마스킹과 매칭 결과를 확인하는 디버그 API"},
     {"name": "V1 - 건물", "description": "기존 앱 호환 건물 CRUD와 상태 API"},
@@ -63,13 +63,13 @@ OPENAPI_TAGS = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize the legacy `/api/slam/*` dependencies without owning v2 DB state."""
+    """Initialize `/api/slam/*` dependencies (메인 사용자 앱 endpoint v3)."""
 
     slam_pool = None
     slam_queue = None
     slam_routes_module = None
     try:
-        from config.settings import settings as legacy_slam_settings
+        from config.settings import settings as slam_settings
         from routes import slam_routes
         from slam_engines.rtabmap.engine import RTABMapEngine
         from storage.postgres_adapter import PostgresAdapter
@@ -93,19 +93,19 @@ async def lifespan(app: FastAPI):
                 slam_queue = SLAMJobQueue(
                     adapter,
                     RTABMapEngine(),
-                    legacy_slam_settings.MAPS_DIR,
+                    slam_settings.MAPS_DIR,
                 )
                 await slam_queue.start_worker()
                 slam_routes.job_queue = slam_queue
             except Exception as exc:
-                logger.warning("legacy SLAM job queue disabled: %s", exc)
+                logger.warning("SLAM job queue disabled: %s", exc)
                 slam_routes.job_queue = None
         except Exception as exc:
-            logger.warning("legacy SLAM DB adapter disabled: %s", exc)
+            logger.warning("SLAM DB adapter disabled: %s", exc)
             slam_routes.postgres_adapter = None
             slam_routes.job_queue = None
     except Exception as exc:
-        logger.warning("legacy SLAM router initialized without dependencies: %s", exc)
+        logger.warning("SLAM router initialized without dependencies: %s", exc)
 
     yield
 
@@ -144,7 +144,7 @@ try:
 
     app.include_router(slam_routes.router)
 except Exception as exc:
-    logger.warning("legacy SLAM router not registered: %s", exc)
+    logger.warning("SLAM router not registered: %s", exc)
 
 
 @app.get("/v3/api-docs", include_in_schema=False)
