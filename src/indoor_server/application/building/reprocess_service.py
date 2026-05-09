@@ -119,6 +119,9 @@ class RTABMapReprocessRunner:
             6 if rgbd_enabled else self._feature_strategy
         )
 
+        # introlab iOS 앱 호환: RGB↔depth 비정수 비율 (1920×1440 / 256×192 = 7.5×) 처리.
+        # ImagePreDecimation=1 + DepthAsMask=true 이면 RTABMap 가 internal interpolate.
+        # Hard error 는 decimation factor 가 depth 차원을 나눠떨어뜨리지 않을 때만.
         args = [
             self._binary_path,
             "--Mem/IncrementalMemory", "true",
@@ -129,6 +132,8 @@ class RTABMapReprocessRunner:
             "--Rtabmap/LoopThr", str(loop_thr),
             "--Mem/STMSize", "30",
             "--RGBD/Enabled", "true" if rgbd_enabled else "false",
+            "--Mem/ImagePreDecimation", "1",   # 명시 — depth 비정수 비율도 OK
+            "--Mem/DepthAsMask", "true",        # depth 를 RGB 에 맞춰 interpolate
             f"--Kp/DetectorStrategy={ds}",
             f"--Vis/FeatureType={ds}",
             "--uwarn",
