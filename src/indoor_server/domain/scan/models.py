@@ -71,6 +71,11 @@ class POIPhotoRow(BaseModel):
 
 
 class BranchMarkRow(BaseModel):
+    """Sidecar v8 부터 node_type/width_m/mark_session_id/connect_*/dx-dy-dz_local 추가.
+
+    v6/v7 호환: 새 컬럼 모두 Optional (default None). v8 sidecar 만 채움.
+    """
+
     model_config = ConfigDict(frozen=True)
 
     id: int
@@ -81,6 +86,15 @@ class BranchMarkRow(BaseModel):
     tx: float
     ty: float
     tz: float
+    # v8 추가
+    node_type: str = "corridor"             # 'corridor' | 'corner'
+    width_m: float | None = None
+    connect_hint: str | None = None
+    connect_node_id: str | None = None
+    mark_session_id: str | None = None
+    dx_local: float | None = None
+    dy_local: float | None = None
+    dz_local: float | None = None
 
 
 class YOLODetectionRow(BaseModel):
@@ -120,6 +134,31 @@ class InterfloorMarkRow(BaseModel):
     tx: float
     ty: float
     tz: float
+    # v8 추가
+    dx_local: float | None = None
+    dy_local: float | None = None
+    dz_local: float | None = None
+
+
+class BranchEdgeRow(BaseModel):
+    """v9: 사용자가 직접 찍은 branch_mark 사이의 명시적 edge.
+
+    kind: 'sequential' (corridor↔corridor 직접) | 'cornerPolygon' (corner cycle 의 한 변).
+    polygon_closed: 1 = closed cycle, NULL = open.
+    from/to_node_id: branch_mark.id 의 string 표현.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    scan_id: str
+    from_node_id: str
+    to_node_id: str
+    kind: str  # 'sequential' | 'cornerPolygon'
+    length_m: float
+    mark_session_id: str | None = None
+    polygon_closed: int | None = None
+    created_at: int | None = None
 
 
 class SidecarContents(BaseModel):
@@ -135,6 +174,8 @@ class SidecarContents(BaseModel):
     yolo_detections: list[YOLODetectionRow]
     # Sprint 65 v6 추가. v4/v5 sidecar 에서는 빈 리스트.
     interfloor_marks: list[InterfloorMarkRow] = []
+    # v9 추가 — 사용자가 명시한 branch_mark 사이의 edge. 이전 버전은 빈 리스트.
+    branch_edges: list[BranchEdgeRow] = []
 
 
 class ScanIngestResult(BaseModel):

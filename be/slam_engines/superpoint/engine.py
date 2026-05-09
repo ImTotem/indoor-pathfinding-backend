@@ -188,10 +188,16 @@ class SuperPointEngine(SLAMEngineBase):
                     iterationsCount=1000,
                 )
 
-                if not ok or inliers is None or len(inliers) < 4:
+                if not ok or inliers is None or len(inliers) < 8:
                     continue
 
                 n_in = len(inliers)
+                # confidence = inlier ratio. wrong-keyframe match 자동 reject.
+                # 이번 세션 검증: lenient (4) 시 wrong location 자신있게 응답.
+                # 8 + 0.30 이 wrong-match 차단의 안전 임계.
+                _conf_local = n_in / max(len(pts_3d), 1)
+                if _conf_local < 0.30:
+                    continue
 
                 # Convert PnP result to RTABMap world pose
                 # (same convention as RTABMapEngine / map_manager)

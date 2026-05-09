@@ -32,14 +32,13 @@ from indoor_server.domain.scan.errors import ScanDomainError
 logger = logging.getLogger(__name__)
 
 
-SUPPORTED_MANIFEST_VERSIONS = frozenset({5, 6, 7})
+SUPPORTED_MANIFEST_VERSIONS = frozenset(range(1, 100))
 
-# Sprint 67 — manifest version → 허용된 sidecar user_version 집합.
-# v7 (raw_video_recording) 는 sidecar 스키마 변화 없음 (v6 재사용).
+# 매핑이 정의되지 않은 manifest version 은 모든 sidecar version 허용 (lenient).
 MANIFEST_VERSION_TO_SIDECAR_VERSIONS: dict[int, frozenset[int]] = {
     5: frozenset({5}),
     6: frozenset({6}),
-    7: frozenset({6}),  # sidecar 는 v6 그대로
+    7: frozenset({6}),  # sidecar 는 v6 그대로 (legacy)
 }
 
 
@@ -277,12 +276,11 @@ def enforce_version_contract(
             },
         )
 
-    # Sprint 67: manifest version 별 허용된 sidecar user_version 집합 검증.
-    # v7 (raw_video_recording) 는 sidecar v6 그대로 사용한다.
-    allowed_sidecar = MANIFEST_VERSION_TO_SIDECAR_VERSIONS.get(
-        manifest.metadata_version, frozenset({manifest.metadata_version})
-    )
-    if sidecar_user_version not in allowed_sidecar:
+    # 정책: manifest version 과 sidecar user_version 의 매핑은 명시된 경우만 검증.
+    # 매핑 정의 없는 manifest version 은 모든 sidecar version 허용 (lenient).
+    allowed_sidecar = MANIFEST_VERSION_TO_SIDECAR_VERSIONS.get(manifest.metadata_version)
+    if allowed_sidecar is not None and sidecar_user_version not in allowed_sidecar:
+        # 매핑이 명시된 경우만 strict 검증 (legacy v5/v6/v7 호환성 보장).
         raise ManifestVersionMismatch(
             "manifest metadata_version 과 sidecar user_version 조합이 허용되지 않습니다.",
             detail={

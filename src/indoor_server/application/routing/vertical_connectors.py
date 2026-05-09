@@ -22,16 +22,46 @@ class VerticalEdge:
     source_ref: dict[str, object]
 
 
+# 사용자 verticalPreference → 허용 connector_type set.
+# escalator 는 connector_key_for_node 에서 미인식이라 graph 도달 안 하지만,
+# 향후 supported 시 STAIRS 그룹에 함께 묶이도록 미리 포함.
+_ALLOWED_BY_PREFERENCE: dict[str, set[str]] = {
+    "ELEVATOR": {"elevator"},
+    "STAIRS": {"stair", "stairs", "escalator"},
+}
+
+
+def _allowed_connector_types(vertical_preference: str | None) -> set[str] | None:
+    if vertical_preference is None:
+        return None
+    return _ALLOWED_BY_PREFERENCE.get(vertical_preference.upper())
+
+
+def _connector_type_of_edge(edge: VerticalEdge) -> str:
+    return str(edge.source_ref.get("connector_type") or "").strip().lower()
+
+
 def add_vertical_edges(
     graph: nx.Graph,
     node_lookup: dict[UUID, MapNodeRow],
     *,
     explicit_edges: list[VerticalEdge] | None = None,
+    vertical_preference: str | None = None,
 ) -> int:
-    """Add explicit and inferred stair/elevator transitions to graph."""
+    """Add explicit and inferred stair/elevator transitions to graph.
+
+    `vertical_preference`:
+      - "ELEVATOR" → elevator only.
+      - "STAIRS"   → stair/escalator only.
+      - None       → no filter (legacy).
+    """
+    allowed = _allowed_connector_types(vertical_preference)
+
     added = 0
     for edge in explicit_edges or []:
         if edge.from_node_id not in node_lookup or edge.to_node_id not in node_lookup:
+            continue
+        if allowed is not None and _connector_type_of_edge(edge) not in allowed:
             continue
         _add_transition_edge(graph, edge)
         added += 1
@@ -40,7 +70,7 @@ def add_vertical_edges(
         frozenset((edge.from_node_id, edge.to_node_id))
         for edge in explicit_edges or []
     }
-    for edge in infer_vertical_edges(node_lookup):
+    for edge in infer_vertical_edges(node_lookup, vertical_preference=vertical_preference):
         if frozenset((edge.from_node_id, edge.to_node_id)) in explicit_pairs:
             continue
         _add_transition_edge(graph, edge)
@@ -50,13 +80,20 @@ def add_vertical_edges(
 
 def infer_vertical_edges(
     node_lookup: dict[UUID, MapNodeRow],
+    *,
+    vertical_preference: str | None = None,
 ) -> list[VerticalEdge]:
     """Infer cross-floor transitions from semantic stair/elevator nodes."""
+    allowed = _allowed_connector_types(vertical_preference)
     groups: dict[str, list[MapNodeRow]] = defaultdict(list)
     for node in node_lookup.values():
         key = connector_key_for_node(node)
         if key is None:
             continue
+        if allowed is not None:
+            facility = key.split(":", 1)[0]
+            if facility not in allowed:
+                continue
         groups[key].append(node)
 
     edges: list[VerticalEdge] = []

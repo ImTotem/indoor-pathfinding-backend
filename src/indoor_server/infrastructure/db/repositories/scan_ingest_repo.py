@@ -76,6 +76,7 @@ class ScanIngestRepository:
         await self._insert_branch_marks(contents, scan_id)
         await self._insert_yolo_detections(contents, scan_id)
         await self._insert_interfloor_marks(contents, scan_id)
+        await self._insert_branch_edges(contents, scan_id)
 
         logger.info(
             "ingest complete",
@@ -84,6 +85,7 @@ class ScanIngestRepository:
                 "keyframes": len(contents.keyframes),
                 "poi_marks": len(contents.poi_marks),
                 "interfloor_marks": len(contents.interfloor_marks),
+                "branch_edges": len(contents.branch_edges),
                 "replace": replace,
             },
         )
@@ -235,6 +237,15 @@ class ScanIngestRepository:
                 "tx": bm.tx,
                 "ty": bm.ty,
                 "tz": bm.tz,
+                # v8 추가
+                "node_type": bm.node_type,
+                "width_m": bm.width_m,
+                "connect_hint": bm.connect_hint,
+                "connect_node_id": bm.connect_node_id,
+                "mark_session_id": bm.mark_session_id,
+                "dx_local": bm.dx_local,
+                "dy_local": bm.dy_local,
+                "dz_local": bm.dz_local,
             }
             for bm in contents.branch_marks
         ]
@@ -278,7 +289,30 @@ class ScanIngestRepository:
                 "tx": im.tx,
                 "ty": im.ty,
                 "tz": im.tz,
+                # v8 추가
+                "dx_local": im.dx_local,
+                "dy_local": im.dy_local,
+                "dz_local": im.dz_local,
             }
             for im in contents.interfloor_marks
         ]
         await self._session.execute(sa.insert(t.interfloor_mark), rows)
+
+    async def _insert_branch_edges(self, contents: SidecarContents, scan_id: str) -> None:
+        """v9: 사용자 명시 branch_mark 사이 edge 영속화."""
+        if not contents.branch_edges:
+            return
+        rows = [
+            {
+                "scan_id": scan_id,
+                "from_node_id": be.from_node_id,
+                "to_node_id": be.to_node_id,
+                "kind": be.kind,
+                "length_m": be.length_m,
+                "mark_session_id": be.mark_session_id,
+                "polygon_closed": be.polygon_closed,
+                "created_at": be.created_at,
+            }
+            for be in contents.branch_edges
+        ]
+        await self._session.execute(sa.insert(t.branch_edge), rows)

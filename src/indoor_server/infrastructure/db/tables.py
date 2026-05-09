@@ -493,6 +493,15 @@ branch_mark = sa.Table(
     sa.Column("tx", sa.Float, nullable=False),
     sa.Column("ty", sa.Float, nullable=False),
     sa.Column("tz", sa.Float, nullable=False),
+    # v8 추가
+    sa.Column("node_type", sa.Text, nullable=False, server_default="corridor"),
+    sa.Column("width_m", sa.Float, nullable=True),
+    sa.Column("connect_hint", sa.Text, nullable=True),
+    sa.Column("connect_node_id", sa.Text, nullable=True),
+    sa.Column("mark_session_id", sa.Text, nullable=True),
+    sa.Column("dx_local", sa.Float, nullable=True),
+    sa.Column("dy_local", sa.Float, nullable=True),
+    sa.Column("dz_local", sa.Float, nullable=True),
     sa.ForeignKeyConstraint(
         ["scan_id", "keyframe_seq"],
         ["keyframe_meta.scan_id", "keyframe_meta.seq"],
@@ -515,6 +524,10 @@ interfloor_mark = sa.Table(
     sa.Column("tx", sa.Float, nullable=False),
     sa.Column("ty", sa.Float, nullable=False),
     sa.Column("tz", sa.Float, nullable=False),
+    # v8 추가
+    sa.Column("dx_local", sa.Float, nullable=True),
+    sa.Column("dy_local", sa.Float, nullable=True),
+    sa.Column("dz_local", sa.Float, nullable=True),
     sa.CheckConstraint(
         "connector_type IN ('elevator','escalator','stairs')",
         name="ck_interfloor_mark_connector_type",
@@ -525,6 +538,31 @@ interfloor_mark = sa.Table(
         ondelete="CASCADE",
     ),
     sa.Index("ix_interfloor_mark_scan", "scan_id"),
+)
+
+
+# ── branch_edge (v9: 사용자 명시 branch_mark 끼리의 edge) ─────────────────────
+
+branch_edge = sa.Table(
+    "branch_edge",
+    metadata,
+    sa.Column("id", sa.BigInteger, primary_key=True, autoincrement=True),
+    sa.Column("scan_id", UUID(as_uuid=False), nullable=False),
+    sa.Column("from_node_id", sa.Text, nullable=False),  # branch_mark.id 의 string
+    sa.Column("to_node_id", sa.Text, nullable=False),
+    sa.Column("kind", sa.Text, nullable=False),  # 'sequential' | 'cornerPolygon'
+    sa.Column("length_m", sa.Float, nullable=False),
+    sa.Column("mark_session_id", sa.Text, nullable=True),
+    sa.Column("polygon_closed", sa.Integer, nullable=True),
+    sa.Column("created_at", sa.BigInteger, nullable=False),
+    sa.CheckConstraint(
+        "kind IN ('sequential','cornerPolygon')",
+        name="ck_branch_edge_kind",
+    ),
+    sa.ForeignKeyConstraint(
+        ["scan_id"], ["scan_session.scan_id"], ondelete="CASCADE",
+    ),
+    sa.Index("ix_branch_edge_scan", "scan_id"),
 )
 
 # ── yolo_detection ────────────────────────────────────────────────────────────

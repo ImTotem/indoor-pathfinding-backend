@@ -65,12 +65,16 @@ class GraphLoader:
         *,
         scan_ids: list[str],
         merge_overlaps: bool = False,
+        vertical_preference: str | None = None,
     ) -> tuple[nx.Graph, dict[UUID, MapNodeRow], list[UUID], ScanMergeReport | None]:
         """Load multiple scan graphs as a route-time union graph.
 
         `merge_overlaps=False` is the safe default for multi-floor routing. When
         callers know the scans are overlapping same-floor RTABMap scans, setting
         it to true estimates route-time overlap bridges.
+
+        `vertical_preference` ("ELEVATOR" | "STAIRS" | None) restricts which
+        connector types contribute cross-floor edges. None = unfiltered.
         """
         if not scan_ids:
             raise ScanNotFoundError("")
@@ -101,6 +105,7 @@ class GraphLoader:
             merge_result.graph,
             merge_result.node_lookup,
             explicit_edges=explicit_edges,
+            vertical_preference=vertical_preference,
         )
         merge_result.graph.graph["vertical_edge_count"] = vertical_edge_count
         return (

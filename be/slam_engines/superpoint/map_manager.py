@@ -133,6 +133,55 @@ def _parse_calibration_K_and_local(blob: bytes) -> Tuple[np.ndarray, np.ndarray]
     return K, local_transform
 
 
+def _smart_select_keyframes(
+    all_ids: List[int],
+    transforms: Dict[int, np.ndarray],
+    min_translation_m: float = 0.30,
+    min_rotation_deg: float = 15.0,
+    force_keep_rotation_deg: float = 45.0,
+) -> List[int]:
+    """Translation/rotation 누적 기반 keyframe subsample.
+
+    인접 frame 간 baseline 이 너무 작으면 triangulation 부정확. 같은 view 를
+    오래 본 frame 도 redundant. 마지막 keep 된 frame 으로부터:
+      - translation ≥ min_translation_m  → keep
+      - rotation ≥ min_rotation_deg     → keep
+      - rotation ≥ force_keep_rotation_deg → keep (큰 방향 전환은 무조건)
+    셋 다 미달이면 redundant.
+    """
+    import math
+
+    def _yaw(R: np.ndarray) -> float:
+        return math.atan2(float(R[1, 0]), float(R[0, 0]))
+
+    def _rot_diff(R_a: np.ndarray, R_b: np.ndarray) -> float:
+        # axis-angle 거리 (안정적). trace((R_a^T R_b)) → angle
+        R = R_b @ R_a.T
+        cos_t = max(-1.0, min(1.0, (np.trace(R) - 1.0) / 2.0))
+        return math.degrees(math.acos(cos_t))
+
+    keep: List[int] = []
+    last_T: np.ndarray | None = None
+    for nid in all_ids:
+        T34 = transforms.get(nid)
+        if T34 is None:
+            continue
+        if last_T is None:
+            keep.append(nid)
+            last_T = T34
+            continue
+        d = float(np.linalg.norm(T34[:3, 3] - last_T[:3, 3]))
+        rot = _rot_diff(last_T[:3, :3], T34[:3, :3])
+        if (
+            d >= min_translation_m
+            or rot >= min_rotation_deg
+            or rot >= force_keep_rotation_deg
+        ):
+            keep.append(nid)
+            last_T = T34
+    return keep
+
+
 # ---------------------------------------------------------------------------
 # Loaded map
 # ---------------------------------------------------------------------------
@@ -236,6 +285,22 @@ class SuperPointLoadedMap:
                 f"[SuperPoint] Triangulation done in {time.time()-t1:.1f}s: "
                 f"{n_with_3d}/{len(self.node_ids)} frames with 3D coverage"
             )
+
+            # ML depth fill — 실험적. NaN 은 줄지만 PnP inliers 안 늘어 측위 정확도 역효과.
+            # opt-in: env INDOOR_ENABLE_ML_DEPTH_FILL=1 일 때만 활성.
+            import os as _os
+            if _os.environ.get("INDOOR_ENABLE_ML_DEPTH_FILL") == "1":
+                try:
+                    t2 = time.time()
+                    n_filled, n_attempted = self._fill_nan_with_ml_depth()
+                    logger.info(
+                        f"[SuperPoint] ML depth fill done in {time.time()-t2:.1f}s: "
+                        f"filled {n_filled}/{n_attempted} NaN keypoints"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[SuperPoint] ML depth fill skipped: {type(exc).__name__}: {exc}"
+                    )
 
     def _triangulate_via_multi_view(
         self,
@@ -354,6 +419,179 @@ class SuperPointLoadedMap:
         logger.info(
             f"[SuperPoint] triangulation: pairs={pair_processed} (neighbor offsets={neighbor_offsets})"
         )
+
+    def _fill_nan_with_ml_depth(
+        self,
+        model_id: str = "depth-anything/Depth-Anything-V2-Base-hf",
+        min_anchors: int = 20,
+        ransac_iters: int = 400,
+        ransac_inlier_thresh_rel: float = 0.08,
+        depth_min_m: float = 0.2,
+        depth_max_m: float = 30.0,
+    ) -> tuple[int, int]:
+        """ML monocular depth 로 NaN keypoint 의 world 3D 채움.
+
+        흐름:
+          1. Depth Anything V2 로 keyframe 별 relative depth map 추론.
+          2. multi-view triangulated 3D 가 있는 keypoint (anchor) 의 absolute depth 와
+             ML depth 의 (a, b) 를 RANSAC linear fit: abs = a * rel + b.
+          3. NaN keypoint 의 (u, v) 에서 rel depth → absolute → unproject → world 3D.
+
+        Returns: (filled_count, attempted_count)
+        """
+        from transformers import pipeline
+        from PIL import Image
+
+        # 모델 로드 (CUDA 시 device=0)
+        device_arg = 0 if str(self.device).startswith("cuda") else -1
+        depth_pipe = pipeline("depth-estimation", model=model_id, device=device_arg)
+
+        # calibration + transforms
+        conn = sqlite3.connect(self.db_path)
+        try:
+            transforms = _parse_node_transforms(conn)
+            calib_row = conn.execute(
+                "SELECT calibration FROM Data WHERE id = ? LIMIT 1",
+                (self.node_ids[0],),
+            ).fetchone()
+            if not calib_row or not calib_row[0]:
+                raise RuntimeError("calibration BLOB missing")
+            K, local_transform = _parse_calibration_K_and_local(bytes(calib_row[0]))
+            C = local_transform[:3, :3]
+        finally:
+            conn.close()
+
+        n_filled = 0
+        n_attempted = 0
+        n_frames_aligned = 0
+        n_frames_no_anchor = 0
+
+        for nid in self.node_ids:
+            if nid not in transforms:
+                continue
+            # 이미지 로드 (다른 connection — 동시성 안전)
+            with sqlite3.connect(self.db_path) as conn:
+                img = _load_gray_float(conn, nid)
+            if img is None:
+                continue
+
+            # ML depth 추론
+            img_uint8 = (img * 255).clip(0, 255).astype(np.uint8)
+            pil = Image.fromarray(img_uint8).convert("RGB")
+            try:
+                out = depth_pipe(pil)
+                rel_depth = np.array(out["depth"], dtype=np.float32)
+            except Exception as exc:
+                logger.warning(f"[ML depth] inference failed for node={nid}: {exc}")
+                continue
+            if rel_depth.shape != img.shape:
+                rel_depth = cv2.resize(
+                    rel_depth, (img.shape[1], img.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+            # camera pose (world → optical)
+            T_b_w = np.eye(4, dtype=np.float64)
+            T_b_w[:3, :] = transforms[nid]
+            T_w_b = np.linalg.inv(T_b_w)
+            R_wo = C @ T_w_b[:3, :3]
+            t_wo = C @ T_w_b[:3, 3]
+
+            kps = self.keyframe_feats[nid]['keypoints'][0].cpu().numpy().astype(np.float32)
+            world3d = self.keyframe_world3d[nid]
+            valid = ~np.isnan(world3d).any(axis=1)
+            n_anchor = int(valid.sum())
+            if n_anchor < min_anchors:
+                n_frames_no_anchor += 1
+                continue
+
+            # anchor 의 absolute depth (optical z)
+            X_opt_anchor = (R_wo @ world3d[valid].T).T + t_wo
+            abs_d = X_opt_anchor[:, 2]
+
+            # rel depth at anchor (u, v)
+            uv_anchor = kps[valid]
+            uv_int = np.round(uv_anchor).astype(int)
+            uv_int[:, 0] = np.clip(uv_int[:, 0], 0, rel_depth.shape[1] - 1)
+            uv_int[:, 1] = np.clip(uv_int[:, 1], 0, rel_depth.shape[0] - 1)
+            rel_at = rel_depth[uv_int[:, 1], uv_int[:, 0]]
+
+            # 이상값 제외 (anchor depth 가 양수 + 범위 내)
+            ok_anchor = (abs_d > depth_min_m) & (abs_d < depth_max_m) & np.isfinite(rel_at)
+            if int(ok_anchor.sum()) < min_anchors:
+                n_frames_no_anchor += 1
+                continue
+            rel_at = rel_at[ok_anchor]
+            abs_d = abs_d[ok_anchor]
+
+            # RANSAC linear fit (a, b)
+            best_inliers = 0
+            best_a = best_b = None
+            rng = np.random.default_rng(seed=int(nid))
+            for _ in range(ransac_iters):
+                idx = rng.choice(len(rel_at), size=2, replace=False)
+                r1, r2 = rel_at[idx]
+                a1, a2 = abs_d[idx]
+                if abs(r1 - r2) < 1e-6:
+                    continue
+                a = (a1 - a2) / (r1 - r2)
+                b = a1 - a * r1
+                pred = a * rel_at + b
+                err = np.abs(pred - abs_d)
+                inlier = err < (np.abs(abs_d) * ransac_inlier_thresh_rel + 0.05)
+                if int(inlier.sum()) > best_inliers:
+                    best_inliers = int(inlier.sum())
+                    best_a, best_b = a, b
+            if best_a is None or best_inliers < min_anchors // 2:
+                n_frames_no_anchor += 1
+                continue
+            # least squares re-fit on inliers
+            pred = best_a * rel_at + best_b
+            err = np.abs(pred - abs_d)
+            inlier_mask = err < (np.abs(abs_d) * ransac_inlier_thresh_rel + 0.05)
+            if int(inlier_mask.sum()) >= 2:
+                A = np.stack([rel_at[inlier_mask], np.ones(inlier_mask.sum())], axis=1)
+                sol, *_ = np.linalg.lstsq(A, abs_d[inlier_mask], rcond=None)
+                best_a, best_b = float(sol[0]), float(sol[1])
+            n_frames_aligned += 1
+
+            # NaN keypoint 채우기
+            nan_idx = np.flatnonzero(~valid)
+            if len(nan_idx) == 0:
+                continue
+            n_attempted += len(nan_idx)
+            uv_nan = kps[nan_idx]
+            uv_nan_int = np.round(uv_nan).astype(int)
+            uv_nan_int[:, 0] = np.clip(uv_nan_int[:, 0], 0, rel_depth.shape[1] - 1)
+            uv_nan_int[:, 1] = np.clip(uv_nan_int[:, 1], 0, rel_depth.shape[0] - 1)
+            rel_nan = rel_depth[uv_nan_int[:, 1], uv_nan_int[:, 0]]
+            abs_nan = best_a * rel_nan + best_b
+
+            ok_d = (abs_nan > depth_min_m) & (abs_nan < depth_max_m) & np.isfinite(abs_nan)
+            if not ok_d.any():
+                continue
+
+            u = uv_nan[:, 0]
+            v = uv_nan[:, 1]
+            x_opt = (u - K[0, 2]) * abs_nan / K[0, 0]
+            y_opt = (v - K[1, 2]) * abs_nan / K[1, 1]
+            z_opt = abs_nan
+            pts_opt = np.stack([x_opt, y_opt, z_opt], axis=1)
+
+            # optical → world: X_w = R_wo^T (X_opt - t_wo)
+            R_ow = R_wo.T
+            pts_world = (R_ow @ (pts_opt - t_wo).T).T
+
+            for k, w_pt, ok in zip(nan_idx, pts_world, ok_d):
+                if ok and np.all(np.isfinite(w_pt)):
+                    self.keyframe_world3d[nid][k] = w_pt.astype(np.float32)
+                    n_filled += 1
+
+        logger.info(
+            f"[ML depth] frames_aligned={n_frames_aligned} "
+            f"frames_skipped(no_anchor)={n_frames_no_anchor}"
+        )
+        return n_filled, n_attempted
 
     def top_k_candidates(
         self, q_desc_mean: torch.Tensor, k: int = TOP_K

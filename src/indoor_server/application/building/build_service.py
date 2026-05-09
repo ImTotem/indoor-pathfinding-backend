@@ -483,7 +483,9 @@ class BuildService:
 
         실패 시 graceful degradation: log + raw db 그대로 build_pipeline 진입.
         """
-        if manifest_mode != "raw_arkit_recording":
+        # raw_arkit_recording: iOS RTABMap step1 결과를 서버가 reprocess.
+        # raw_video_recording: 우리 rtabmap_seeder 가 만든 db 도 reprocess (graph 일관성).
+        if manifest_mode not in ("raw_arkit_recording", "raw_video_recording"):
             return None
         if not self._reprocess_runner.is_available():
             logger.warning(
@@ -823,10 +825,21 @@ class BuildService:
         edges_out = result.get("edges", [])
         nav_metrics = result.get("metrics", {}).get("navgraph", {})
 
-        # quality gate: nodes≥3, edges≥nodes-1
+        # v9: branch_edge 가 있으면 sprint82 quality gate 우회 (v2 path 사용)
+        async with AsyncSession(self._engine) as _qg_session:
+            v2_count = (
+                await _qg_session.execute(
+                    sa.select(sa.func.count())
+                    .select_from(t.branch_edge)
+                    .where(t.branch_edge.c.scan_id == scan_id)
+                )
+            ).scalar() or 0
+        v2_path = v2_count > 0
+
+        # quality gate: nodes≥3, edges≥nodes-1 (sprint82 path 만)
         n_nodes = len(nodes_out)
         n_edges = len(edges_out)
-        if n_nodes < 3 or n_edges < max(0, n_nodes - 1):
+        if not v2_path and (n_nodes < 3 or n_edges < max(0, n_nodes - 1)):
             detail = (
                 f"video_mode_navgraph_too_small: nodes={n_nodes} edges={n_edges}. "
                 f"min nodes=3, min edges={max(0, n_nodes - 1)}"
@@ -901,12 +914,30 @@ class BuildService:
                 length_m=float(raw.get("weight", 1.0)),
             )
 
-        map_nodes = [_make_node(n) for n in nodes_out]
-        node_coords = {n.node_id: (n.x, n.y) for n in map_nodes}
-        map_edges = [
-            e for raw in edges_out
-            if (e := _make_edge(raw, node_coords)) is not None
-        ]
+        # v9: branch_edge 가 있으면 sprint82 격자 결과 무시 + 사용자 명시 corridor 사용.
+        # 사용자 정책: sprint82 폐기, 명시적 노드+엣지만 graph backbone 으로.
+        v2_corridor = await self._load_v2_corridor_backbone(
+            scan_id=scan_id, scan_uuid=scan_uuid, build_job_uuid=job_uuid,
+        )
+        if v2_corridor is not None:
+            map_nodes, map_edges = v2_corridor
+            logger.info(
+                "video_mode_pipeline: v2 explicit graph 사용 (sprint82 격자 무시) "
+                "scan_id=%s nodes=%d edges=%d",
+                scan_id, len(map_nodes), len(map_edges),
+            )
+        else:
+            map_nodes = [_make_node(n) for n in nodes_out]
+            node_coords = {n.node_id: (n.x, n.y) for n in map_nodes}
+            map_edges = [
+                e for raw in edges_out
+                if (e := _make_edge(raw, node_coords)) is not None
+            ]
+            logger.info(
+                "video_mode_pipeline: sprint82 결과 사용 (v2 데이터 없음) "
+                "scan_id=%s nodes=%d edges=%d",
+                scan_id, len(map_nodes), len(map_edges),
+            )
 
         # A-1/A-2: POI projection step — sprint 49 모듈 재사용
         # video_mode path에서도 POIProjectionStep을 inline 호출한다.
@@ -988,8 +1019,11 @@ class BuildService:
                     _poi_err,
                 )
 
-        # branch_mark: 사용자가 찍은 분기점 → graph 의 junction 노드로 추가.
-        # 좌표는 ARKit Y-up frame 이므로 transform 적용 (POI 와 동일 방식).
+        # branch_mark: 사용자가 찍은 분기점/route 노드 → graph 의 junction 으로 추가.
+        # 정책 (v9):
+        #   - node_type='corner': polygon vertex 전용 → graph 추가 X (skip)
+        #   - node_type='corridor' & width_m IS NOT NULL: 이미 v2_corridor backbone 에서 추가됨 → skip
+        #   - node_type='corridor' & width_m IS NULL: route 전용 노드 (interfloor 와 같은 위치) → junction 으로 추가
         try:
             async with AsyncSession(self._engine) as _br_session:
                 from indoor_server.infrastructure.db import tables as _t
@@ -1001,6 +1035,8 @@ class BuildService:
                             _t.branch_mark.c.tx,
                             _t.branch_mark.c.ty,
                             _t.branch_mark.c.tz,
+                            _t.branch_mark.c.node_type,
+                            _t.branch_mark.c.width_m,
                         ).where(_t.branch_mark.c.scan_id == scan_id)
                     )
                 ).fetchall()
@@ -1008,7 +1044,18 @@ class BuildService:
                 # tf 는 위 POI 처리에서 만든 transform 재사용
                 from indoor_server.domain.building.enums import NodeType as _NT
                 br_count = 0
+                br_skip_corner = 0
+                br_skip_corridor_polygon = 0
                 for br in br_rows:
+                    # Skip: corner 는 polygon vertex 전용
+                    if str(br.node_type) == "corner":
+                        br_skip_corner += 1
+                        continue
+                    # Skip: corridor & width 있음 → 이미 v2_corridor backbone 에 들어감
+                    if str(br.node_type) == "corridor" and br.width_m is not None:
+                        br_skip_corridor_polygon += 1
+                        continue
+                    # 추가: corridor (width=null, route 전용) 만 junction 으로
                     arkit_xyz = (float(br.tx), float(br.ty), float(br.tz))
                     if tf is not None and tf.confidence == "high":
                         wx, wy, wz = tf.apply(arkit_xyz)
@@ -1022,38 +1069,27 @@ class BuildService:
                         x=float(wx), y=float(wy), z=float(wz),
                         label=None,
                         source_ref={
-                            "role": "branch_mark",
+                            "role": "branch_mark_route",
                             "branch_mark_id": int(br.id),
+                            "node_type": str(br.node_type),
                             "raw_arkit_xyz": list(arkit_xyz),
                         },
                     )
                     map_nodes.append(br_node)
-                    # 가장 가까운 corridor/junction 노드와 spur edge
-                    target = min(
-                        (n for n in map_nodes if n.node_type in (
-                            NodeType.CORRIDOR, NodeType.POI_ATTACH, NodeType.JUNCTION
-                        ) and n.node_id != br_node.node_id),
-                        key=lambda n: math.hypot(n.x - br_node.x, n.y - br_node.y),
-                        default=None,
+                    # 정책: corridor backbone edge 위에 perpendicular drop 으로 attach.
+                    # 각 target 마다 별도 foot 노드 + edge split + spur.
+                    map_nodes, map_edges = _attach_via_perpendicular_drop(
+                        target=br_node,
+                        map_nodes=map_nodes,
+                        map_edges=map_edges,
+                        scan_uuid=scan_uuid,
+                        job_uuid=job_uuid,
                     )
-                    if target is not None:
-                        d = math.hypot(target.x - br_node.x, target.y - br_node.y)
-                        if d > 0.001:
-                            map_edges.append(MapEdgeVO(
-                                edge_id=uuid5(job_uuid, f"branch-edge:{int(br.id)}"),
-                                scan_id=scan_uuid,
-                                build_job_id=job_uuid,
-                                from_node_id=br_node.node_id,
-                                to_node_id=target.node_id,
-                                edge_type=EdgeType.SKELETON,
-                                polyline=[(br_node.x, br_node.y, br_node.z),
-                                          (target.x, target.y, target.z)],
-                                length_m=d,
-                            ))
                     br_count += 1
                 logger.info(
-                    "video_mode_pipeline: branch nodes 추가 count=%d scan_id=%s",
-                    br_count, scan_id,
+                    "video_mode_pipeline: branch nodes 추가 count=%d "
+                    "(skip_corner=%d skip_corridor_polygon=%d) scan_id=%s",
+                    br_count, br_skip_corner, br_skip_corridor_polygon, scan_id,
                 )
         except Exception as _br_err:
             logger.warning(
@@ -1061,7 +1097,7 @@ class BuildService:
                 scan_id, _br_err,
             )
 
-        # A-6: interfloor_mark connector nodes 통합 (기존 경로와 동일 헬퍼 사용)
+        # A-6: interfloor_mark connector nodes 통합 (POI/branch 와 동일 transform 적용)
         if interfloor_marks:
             map_nodes, map_edges = _append_interfloor_connector_nodes(
                 interfloor_marks=interfloor_marks,
@@ -1069,6 +1105,7 @@ class BuildService:
                 edges=map_edges,
                 scan_id=scan_uuid,
                 build_job_id=job_uuid,
+                arkit_to_rtabmap_transform=tf if pois else None,
             )
 
         # A-6b: mock vertical_connector catalog 행도 graph에 passage 노드로 추가.
@@ -1137,6 +1174,16 @@ class BuildService:
             scan_id, len(map_nodes), len(map_edges),
         )
 
+        # v9 추가: 사용자가 명시한 branch_edge / branch_mark.corner 가 있으면
+        # floor polygon (GeoJSON) 빌드해서 storage 에 저장. 이후 endpoint 가 응답.
+        try:
+            await self._maybe_build_floor_polygon_v2(scan_id=scan_id, build_job_id=build_job_id)
+        except Exception as exc:
+            logger.warning(
+                "floor_polygon_v2 빌드 실패 scan_id=%s err=%s — graph 영향 없음",
+                scan_id, exc,
+            )
+
         # Server 의 SuperPoint cache 를 미리 채움 (cold-start 제거).
         # fire-and-forget — server 가 background thread 로 indexing.
         try:
@@ -1146,6 +1193,198 @@ class BuildService:
             )
         except Exception as exc:
             logger.warning("superpoint warmup trigger 실패 scan_id=%s err=%s", scan_id, exc)
+
+    async def _load_v2_corridor_backbone(
+        self, *, scan_id: str, scan_uuid: UUID, build_job_uuid: UUID,
+    ) -> tuple[list[MapNodeVO], list[MapEdgeVO]] | None:
+        """branch_edge 가 있으면 사용자 명시 corridor backbone 만 graph 로 빌드.
+
+        Returns: (map_nodes, map_edges) 또는 None (v2 데이터 없으면).
+            corridor 노드는 width_m IS NOT NULL 인 branch_mark 만.
+            corner 노드는 polygon 만 (graph 추가 안 함).
+            corridor (width null) / POI / interfloor 는 후속 step (POI projection 등) 이 attach.
+        """
+        from uuid import NAMESPACE_URL, uuid5
+        async with AsyncSession(self._engine) as session:
+            br_rows = (
+                await session.execute(
+                    sa.select(
+                        t.branch_mark.c.id,
+                        t.branch_mark.c.tx, t.branch_mark.c.ty, t.branch_mark.c.tz,
+                        t.branch_mark.c.node_type,
+                        t.branch_mark.c.width_m,
+                        t.branch_mark.c.mark_session_id,
+                    ).where(t.branch_mark.c.scan_id == scan_id)
+                )
+            ).fetchall()
+            be_rows = (
+                await session.execute(
+                    sa.select(
+                        t.branch_edge.c.id,
+                        t.branch_edge.c.from_node_id,
+                        t.branch_edge.c.to_node_id,
+                        t.branch_edge.c.kind,
+                        t.branch_edge.c.length_m,
+                    ).where(t.branch_edge.c.scan_id == scan_id)
+                )
+            ).fetchall()
+
+        if not be_rows:
+            return None
+
+        # PG id ASC 순 = sqlite INSERT 순 → local id (1..N) 복원
+        br_sorted = sorted(br_rows, key=lambda r: r.id)
+        local_id_by_pg = {r.id: i + 1 for i, r in enumerate(br_sorted)}
+        br_by_local = {local_id_by_pg[r.id]: r for r in br_sorted}
+
+        # 1. corridor backbone 노드 (width_m IS NOT NULL 만)
+        # ARKit (tx, ty, tz) → graph (x=tx, y=-tz, z=ty)
+        # corner 는 polygon 만 사용 (graph 추가 X)
+        node_uuid_by_local: dict[int, UUID] = {}
+        map_nodes: list[MapNodeVO] = []
+        for local_id, r in br_by_local.items():
+            if r.node_type != "corridor" or r.width_m is None:
+                continue
+            uid = uuid5(NAMESPACE_URL, f"{build_job_uuid}/v2-corridor:{local_id}")
+            node_uuid_by_local[local_id] = uid
+            map_nodes.append(MapNodeVO(
+                node_id=uid,
+                scan_id=scan_uuid,
+                build_job_id=build_job_uuid,
+                node_type=NodeType.CORRIDOR,
+                x=float(r.tx),
+                y=float(-r.tz),
+                z=float(r.ty),
+                label=None,
+                source_ref={
+                    "role": "v9_explicit_corridor",
+                    "branch_mark_local_id": local_id,
+                    "width_m": float(r.width_m),
+                },
+            ))
+
+        # 2. corridor edges (branch_edge.kind='sequential' 만)
+        map_edges: list[MapEdgeVO] = []
+        for be in be_rows:
+            if be.kind != "sequential":
+                continue
+            from_local = int(be.from_node_id)
+            to_local = int(be.to_node_id)
+            from_uid = node_uuid_by_local.get(from_local)
+            to_uid = node_uuid_by_local.get(to_local)
+            if from_uid is None or to_uid is None:
+                logger.warning(
+                    "v2_corridor: edge %s 의 끝점이 polygon-eligible 아님 (skip)", be.id,
+                )
+                continue
+            from_node = next(n for n in map_nodes if n.node_id == from_uid)
+            to_node = next(n for n in map_nodes if n.node_id == to_uid)
+            map_edges.append(MapEdgeVO(
+                edge_id=uuid5(NAMESPACE_URL, f"{build_job_uuid}/v2-edge:{be.id}"),
+                scan_id=scan_uuid,
+                build_job_id=build_job_uuid,
+                from_node_id=from_uid,
+                to_node_id=to_uid,
+                edge_type=EdgeType.SKELETON,
+                polyline=[
+                    (from_node.x, from_node.y, from_node.z),
+                    (to_node.x, to_node.y, to_node.z),
+                ],
+                length_m=float(be.length_m),
+            ))
+
+        logger.info(
+            "v2_corridor: backbone built scan_id=%s nodes=%d edges=%d (corridor width 있음만)",
+            scan_id, len(map_nodes), len(map_edges),
+        )
+        return map_nodes, map_edges
+
+    async def _maybe_build_floor_polygon_v2(
+        self, *, scan_id: str, build_job_id: str
+    ) -> None:
+        """v9 사용자 명시 branch_mark + branch_edge 로 floor polygon (GeoJSON) 빌드.
+
+        데이터 없으면 (옛 sidecar) 무동작. 데이터 있으면 storage 에 GeoJSON 저장.
+        graph 자체는 기존 sprint82 흐름 유지 (이번 단계는 polygon 만 추가).
+        """
+        from indoor_server.application.building.steps.floor_polygon_v2 import (
+            build_floor_polygon, Node as PolyNode, Edge as PolyEdge,
+        )
+        from indoor_server.config import settings as _settings
+        async with AsyncSession(self._engine) as session:
+            br_rows = (
+                await session.execute(
+                    sa.select(
+                        t.branch_mark.c.id,
+                        t.branch_mark.c.tx, t.branch_mark.c.ty, t.branch_mark.c.tz,
+                        t.branch_mark.c.node_type,
+                        t.branch_mark.c.width_m,
+                        t.branch_mark.c.mark_session_id,
+                    ).where(t.branch_mark.c.scan_id == scan_id)
+                )
+            ).fetchall()
+            be_rows = (
+                await session.execute(
+                    sa.select(
+                        t.branch_edge.c.id,
+                        t.branch_edge.c.from_node_id,
+                        t.branch_edge.c.to_node_id,
+                        t.branch_edge.c.kind,
+                    ).where(t.branch_edge.c.scan_id == scan_id)
+                )
+            ).fetchall()
+
+        if not br_rows:
+            logger.info("floor_polygon_v2: branch_mark 없음 — skip scan_id=%s", scan_id)
+            return
+        if not be_rows:
+            logger.info(
+                "floor_polygon_v2: branch_edge 없음 (옛 sidecar 또는 클라가 안 보냄) — skip scan_id=%s",
+                scan_id,
+            )
+            return
+
+        # branch_edge.from/to_node_id 는 sqlite local id (1..N).
+        # PG INSERT 후 PG id 는 다른 값이지만 INSERT 순서가 sqlite id 순서와 일치하므로
+        # PG id ASC 정렬 후 enumerate 로 local id 복원.
+        br_sorted = sorted(br_rows, key=lambda r: r.id)
+        local_id_by_pg = {r.id: i + 1 for i, r in enumerate(br_sorted)}
+
+        nodes = [
+            PolyNode(
+                node_id=str(local_id_by_pg[r.id]),  # sqlite local id (1..N)
+                kind=str(r.node_type),
+                x=float(r.tx),
+                y=float(-r.tz),  # ARKit y-up → polygon 2D 평면 (z forward 를 y 축으로)
+                width_m=float(r.width_m) if r.width_m is not None else None,
+                mark_session_id=str(r.mark_session_id) if r.mark_session_id else None,
+            )
+            for r in br_sorted
+        ]
+        # edge kind 매핑: 'sequential' → 'corridor', 'cornerPolygon' → 'corner'
+        edges = [
+            PolyEdge(
+                edge_id=str(r.id),
+                from_node_id=str(r.from_node_id),  # 이미 sqlite local id (string)
+                to_node_id=str(r.to_node_id),
+                kind="corridor" if str(r.kind) == "sequential" else "corner",
+            )
+            for r in be_rows
+        ]
+        fc = build_floor_polygon(nodes, edges, floor_id=None)
+
+        out_dir = _settings.storage_root / "builds" / build_job_id / "polygon_v2"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "floor_polygon.geojson"
+        import json as _json
+        out_path.write_text(_json.dumps(fc, ensure_ascii=False, indent=2))
+
+        rooms = sum(1 for f in fc["features"] if f["properties"].get("kind") == "room")
+        corridors = sum(1 for f in fc["features"] if f["properties"].get("kind") == "corridor")
+        logger.info(
+            "floor_polygon_v2: saved scan_id=%s rooms=%d corridors=%d path=%s",
+            scan_id, rooms, corridors, out_path,
+        )
 
     async def _warmup_superpoint(self, *, scan_id: str, rtabmap_db_path: Path) -> None:
         """Build 완료 후 server 의 SuperPoint cache 를 preload."""
@@ -1229,10 +1468,19 @@ def _append_interfloor_connector_nodes(
     edges: list[MapEdgeVO],
     scan_id: UUID,
     build_job_id: UUID,
+    arkit_to_rtabmap_transform: Any | None = None,
 ) -> tuple[list[MapNodeVO], list[MapEdgeVO]]:
-    """Create connector route nodes without writing synthetic negative POI FKs."""
+    """Create connector route nodes without writing synthetic negative POI FKs.
+
+    arkit_to_rtabmap_transform: confidence='high' 인 경우 mark 의 ARKit 좌표를
+    RTABMap world frame 으로 변환해 graph 의 corridor/POI 와 frame 정합. POI/branch_mark
+    와 동일 처리.
+    """
     if not interfloor_marks:
         return nodes, edges
+
+    tf = arkit_to_rtabmap_transform
+    transform_high = tf is not None and getattr(tf, "confidence", None) == "high"
 
     base_nodes = list(nodes)
     out_nodes = list(nodes)
@@ -1241,14 +1489,21 @@ def _append_interfloor_connector_nodes(
         connector_type = mark.connector_type.strip().lower()
         connector_key = _connector_key_from_prefix(mark.prefix)
         label = f"{connector_type.upper()} {mark.prefix}"
+        raw_xyz = (float(mark.tx), float(mark.ty), float(mark.tz))
+        if transform_high:
+            wx, wy, wz = tf.apply(raw_xyz)
+            position_source = "arkit_to_rtabmap_transform"
+        else:
+            wx, wy, wz = raw_xyz
+            position_source = "raw_arkit_fallback"
         connector_node = MapNodeVO(
             node_id=uuid5(build_job_id, f"interfloor-connector:{mark.id}"),
             scan_id=scan_id,
             build_job_id=build_job_id,
             node_type=NodeType.POI,
-            x=mark.tx,
-            y=mark.ty,
-            z=mark.tz,
+            x=float(wx),
+            y=float(wy),
+            z=float(wz),
             label=label,
             poi_mark_id=None,
             source_ref={
@@ -1258,31 +1513,150 @@ def _append_interfloor_connector_nodes(
                 "connector_key": connector_key,
                 "prefix": mark.prefix,
                 "keyframe_seq": mark.keyframe_seq,
-                "raw_arkit_xyz": [mark.tx, mark.ty, mark.tz],
+                "raw_arkit_xyz": list(raw_xyz),
+                "world_xyz": [float(wx), float(wy), float(wz)],
+                "position_source": position_source,
             },
         )
         out_nodes.append(connector_node)
-        attach = _nearest_connector_attach_node(connector_node, base_nodes)
-        if attach is None:
-            continue
-        length_m = _distance_3d(connector_node, attach)
-        if length_m <= 0.001:
-            continue
-        out_edges.append(
-            MapEdgeVO(
-                edge_id=uuid5(build_job_id, f"interfloor-connector-edge:{mark.id}"),
-                scan_id=scan_id,
-                build_job_id=build_job_id,
-                from_node_id=connector_node.node_id,
-                to_node_id=attach.node_id,
-                edge_type=EdgeType.POI_SPUR,
-                polyline=[
-                    (connector_node.x, connector_node.y, connector_node.z),
-                    (attach.x, attach.y, attach.z),
-                ],
-                length_m=length_m,
-            )
+        # corridor backbone edge 위 perpendicular drop attach (각 connector 마다 별도 foot)
+        out_nodes, out_edges = _attach_via_perpendicular_drop(
+            target=connector_node,
+            map_nodes=out_nodes,
+            map_edges=out_edges,
+            scan_uuid=scan_id,
+            job_uuid=build_job_id,
         )
+    return out_nodes, out_edges
+
+
+def _attach_via_perpendicular_drop(
+    target: MapNodeVO,
+    map_nodes: list[MapNodeVO],
+    map_edges: list[MapEdgeVO],
+    *,
+    scan_uuid: UUID,
+    job_uuid: UUID,
+    epsilon_m: float = 0.05,
+) -> tuple[list[MapNodeVO], list[MapEdgeVO]]:
+    """target 노드를 corridor backbone edge 에 perpendicular drop attach.
+
+    각 target 마다 가장 가까운 corridor↔corridor edge 의 foot 위치에 새 POI_ATTACH 노드 생성,
+    기존 edge 를 split + target↔foot spur edge 추가. foot 이 edge 끝점 epsilon 이내면
+    끝점 자체를 attach 로 사용 (split 없이 spur 만).
+
+    Returns: 업데이트된 (map_nodes, map_edges).
+    """
+    # corridor backbone 만 후보 — POI/junction/connector 끼리 attach 금지
+    backbone_node_ids = {
+        n.node_id for n in map_nodes
+        if n.node_type in (NodeType.CORRIDOR, NodeType.POI_ATTACH)
+    }
+    candidate_edges = [
+        e for e in map_edges
+        if e.from_node_id in backbone_node_ids and e.to_node_id in backbone_node_ids
+    ]
+    if not candidate_edges:
+        return map_nodes, map_edges
+
+    nodes_by_id = {n.node_id: n for n in map_nodes}
+    best: tuple[MapEdgeVO, float, float, float, float] | None = None
+    for edge in candidate_edges:
+        a = nodes_by_id.get(edge.from_node_id)
+        b = nodes_by_id.get(edge.to_node_id)
+        if a is None or b is None:
+            continue
+        line_x, line_y = b.x - a.x, b.y - a.y
+        line_len_sq = line_x * line_x + line_y * line_y
+        if line_len_sq < 1e-9:
+            continue
+        t_norm = ((target.x - a.x) * line_x + (target.y - a.y) * line_y) / line_len_sq
+        t_norm = max(0.0, min(1.0, t_norm))
+        foot_x = a.x + t_norm * line_x
+        foot_y = a.y + t_norm * line_y
+        d = math.hypot(target.x - foot_x, target.y - foot_y)
+        if best is None or d < best[4]:
+            best = (edge, foot_x, foot_y, t_norm, d)
+
+    if best is None:
+        return map_nodes, map_edges
+
+    edge, foot_x, foot_y, t_norm, dist = best
+    a = nodes_by_id[edge.from_node_id]
+    b = nodes_by_id[edge.to_node_id]
+    edge_len = math.hypot(b.x - a.x, b.y - a.y)
+    epsilon_t = epsilon_m / edge_len if edge_len > 1e-9 else 1.0
+
+    foot_z = (a.z + b.z) / 2.0
+
+    # 끝점 reuse: split 없이 spur 만
+    if t_norm <= epsilon_t:
+        attach_id = edge.from_node_id
+        spur_len = math.hypot(target.x - a.x, target.y - a.y)
+        spur = MapEdgeVO(
+            edge_id=uuid4(),
+            scan_id=scan_uuid, build_job_id=job_uuid,
+            from_node_id=target.node_id, to_node_id=attach_id,
+            edge_type=EdgeType.POI_SPUR,
+            polyline=[(target.x, target.y, target.z), (a.x, a.y, a.z)],
+            length_m=spur_len,
+        )
+        return map_nodes, map_edges + [spur]
+    if t_norm >= 1.0 - epsilon_t:
+        attach_id = edge.to_node_id
+        spur_len = math.hypot(target.x - b.x, target.y - b.y)
+        spur = MapEdgeVO(
+            edge_id=uuid4(),
+            scan_id=scan_uuid, build_job_id=job_uuid,
+            from_node_id=target.node_id, to_node_id=attach_id,
+            edge_type=EdgeType.POI_SPUR,
+            polyline=[(target.x, target.y, target.z), (b.x, b.y, b.z)],
+            length_m=spur_len,
+        )
+        return map_nodes, map_edges + [spur]
+
+    # split 케이스: 새 foot 노드 + edge 분할 + spur
+    foot_node = MapNodeVO(
+        node_id=uuid4(),
+        scan_id=scan_uuid, build_job_id=job_uuid,
+        node_type=NodeType.POI_ATTACH,
+        x=float(foot_x), y=float(foot_y), z=float(foot_z),
+        label=None,
+        source_ref={
+            "role": "perpendicular_foot",
+            "target_node_id": str(target.node_id),
+            "split_from_edge_id": str(edge.edge_id),
+            "perpendicular_dist_m": float(dist),
+        },
+    )
+    seg1_len = math.hypot(foot_x - a.x, foot_y - a.y)
+    seg2_len = math.hypot(b.x - foot_x, b.y - foot_y)
+    seg1 = MapEdgeVO(
+        edge_id=uuid4(),
+        scan_id=scan_uuid, build_job_id=job_uuid,
+        from_node_id=edge.from_node_id, to_node_id=foot_node.node_id,
+        edge_type=edge.edge_type,
+        polyline=[(a.x, a.y, a.z), (foot_x, foot_y, foot_z)],
+        length_m=seg1_len,
+    )
+    seg2 = MapEdgeVO(
+        edge_id=uuid4(),
+        scan_id=scan_uuid, build_job_id=job_uuid,
+        from_node_id=foot_node.node_id, to_node_id=edge.to_node_id,
+        edge_type=edge.edge_type,
+        polyline=[(foot_x, foot_y, foot_z), (b.x, b.y, b.z)],
+        length_m=seg2_len,
+    )
+    spur = MapEdgeVO(
+        edge_id=uuid4(),
+        scan_id=scan_uuid, build_job_id=job_uuid,
+        from_node_id=target.node_id, to_node_id=foot_node.node_id,
+        edge_type=EdgeType.POI_SPUR,
+        polyline=[(target.x, target.y, target.z), (foot_x, foot_y, foot_z)],
+        length_m=float(dist),
+    )
+    out_nodes = map_nodes + [foot_node]
+    out_edges = [e for e in map_edges if e.edge_id != edge.edge_id] + [seg1, seg2, spur]
     return out_nodes, out_edges
 
 
@@ -1290,9 +1664,14 @@ def _nearest_connector_attach_node(
     connector_node: MapNodeVO,
     nodes: list[MapNodeVO],
 ) -> MapNodeVO | None:
+    """connector (interfloor/mock) 의 attach 대상은 corridor backbone 노드만.
+
+    정책: connector ↔ connector, connector ↔ POI/junction 같은 자동 attach 금지.
+    backbone (CORRIDOR) 노드 또는 그 위에 split 으로 만들어진 POI_ATTACH 만 후보.
+    """
     candidates = [
         node for node in nodes
-        if (node.source_ref or {}).get("role") != "vertical_connector_stop"
+        if node.node_type in (NodeType.CORRIDOR, NodeType.POI_ATTACH)
     ]
     if not candidates:
         return None
@@ -1406,6 +1785,16 @@ def _append_mock_connector_nodes(
         )
         out_nodes.append(connector_node)
 
+        # corridor backbone edge 위 perpendicular drop (mock connector 도 동일 정책)
+        out_nodes, out_edges = _attach_via_perpendicular_drop(
+            target=connector_node,
+            map_nodes=out_nodes,
+            map_edges=out_edges,
+            scan_uuid=scan_id,
+            job_uuid=build_job_id,
+        )
+        continue
+        # (legacy code below kept disabled)
         attach = _nearest_connector_attach_node(connector_node, base_nodes)
         if attach is None:
             continue

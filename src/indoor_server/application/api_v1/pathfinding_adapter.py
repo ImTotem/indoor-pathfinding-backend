@@ -51,13 +51,32 @@ class PathfindingAdapter:
         scans = await building_service.get_active_scans_for_building(building_id)
         if not scans:
             raise V1ServiceError(404, "ACTIVE_SCAN_NOT_FOUND", "building has no active scans")
-        start_scan = _scan_for_level(scans, request.start_floor_level)
-        if start_scan is None:
+
+        # 시작 scan 자동 결정 — startScanId 우선, fallback: startFloorLevel.
+        if request.start_scan_id is not None:
+            scan_id_str = str(request.start_scan_id)
+            start_scan = next((s for s in scans if s.scan_id == scan_id_str), None)
+            if start_scan is None:
+                raise V1ServiceError(
+                    404,
+                    "START_SCAN_NOT_FOUND",
+                    "startScanId is not active in this building.",
+                    {"startScanId": scan_id_str},
+                )
+        elif request.start_floor_level is not None:
+            start_scan = _scan_for_level(scans, request.start_floor_level)
+            if start_scan is None:
+                raise V1ServiceError(
+                    404,
+                    "START_FLOOR_NOT_FOUND",
+                    "startFloorLevel has no active scan.",
+                    {"startFloorLevel": request.start_floor_level},
+                )
+        else:
             raise V1ServiceError(
-                404,
-                "START_FLOOR_NOT_FOUND",
-                "startFloorLevel has no active scan.",
-                {"startFloorLevel": request.start_floor_level},
+                422,
+                "START_NOT_SPECIFIED",
+                "either startScanId or startFloorLevel is required.",
             )
 
         goal = await POICatalogService(self._session).destination_endpoint(
@@ -75,6 +94,7 @@ class PathfindingAdapter:
                 merge_overlaps=False,
                 start=start,
                 goal=goal,
+                vertical_preference=request.vertical_preference,
             )
         except (
             ScanNotFoundError,
@@ -92,6 +112,9 @@ class PathfindingAdapter:
             for index, node in enumerate(route.nodes_in_order, start=1)
         ]
         metadata = dict(route.route_metadata or {})
+        metadata["vertical_preference"] = request.vertical_preference
+        metadata["start_scan_id"] = start_scan.scan_id
+        metadata["start_floor_level"] = start_scan.floor_level
         if request.preference != "SHORTEST":
             metadata["preference_ignored"] = True
             metadata["requested_preference"] = request.preference

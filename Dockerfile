@@ -46,6 +46,15 @@ COPY scripts ./scripts
 # 프로젝트 본체 설치
 RUN uv sync --no-dev --frozen
 
+# Sprint 87: hloc (SuperPoint + LightGlue + COLMAP wrapper) + pycolmap
+# - hloc: PyPI 미배포, github master 만 공식. ETH CV 그룹 표준.
+# - pycolmap: COLMAP Python binding (BA / triangulation / DB).
+# venv 외부 system pip 가 아닌 venv 내부 pip 로 설치 (uv 와 충돌 회피).
+RUN /app/.venv/bin/python -m ensurepip --upgrade 2>&1 | tail -1 \
+    && /app/.venv/bin/python -m pip install --no-cache-dir \
+        pycolmap \
+        "git+https://github.com/cvg/Hierarchical-Localization.git@master"
+
 # venv 의 python/uvicorn/alembic 등을 시스템 PATH 로 노출
 # (compose 의 `python -m indoor_server.worker` 가 venv 의 python 으로 resolve 됨)
 ENV PATH="/app/.venv/bin:${PATH}"

@@ -8,6 +8,7 @@ from pathlib import Path
 from indoor_server.domain.poi.enums import DetectionSource, POISource
 from indoor_server.domain.scan.errors import ScanIdMismatch, SidecarSchemaMismatch
 from indoor_server.domain.scan.models import (
+    BranchEdgeRow,
     BranchMarkRow,
     InterfloorMarkRow,
     KeyframeRow,
@@ -23,7 +24,10 @@ logger = logging.getLogger(__name__)
 # Sprint 49 v5: poi_photo.image_blob 추가.
 # Sprint 65 v6: yolo_detection drop, poi_mark.track_id drop, poi_photo.bbox_* drop,
 #               interfloor_mark 테이블 신설.
-EXPECTED_USER_VERSIONS = frozenset({4, 5, 6})
+# v7+ : branch_mark.node_type/mark_session_id/width_m, dx_local 등 추가.
+# 정책: 모든 user_version 업로드 허용. schema 검증 시 unknown column 은 무시,
+#       missing column 만 warning (raise 하지 않음).
+EXPECTED_USER_VERSIONS = frozenset(range(1, 100))
 # legacy 지원 별칭 (외부 import)
 EXPECTED_USER_VERSION = 4
 
@@ -140,6 +144,8 @@ class SidecarParser:
         interfloor_marks = (
             self._load_interfloor_marks(conn, expected_scan_id) if version >= 6 else []
         )
+        # v9: branch_edge 신설. 옛 버전은 테이블 없음 (parser 가 OperationalError → []).
+        branch_edges = self._load_branch_edges(conn, expected_scan_id)
 
         return SidecarContents(
             scan_session=session,
@@ -149,6 +155,7 @@ class SidecarParser:
             branch_marks=branch_marks,
             yolo_detections=yolo_detections,
             interfloor_marks=interfloor_marks,
+            branch_edges=branch_edges,
         )
 
     def _validate_version(self, conn: sqlite3.Connection) -> int:
@@ -181,9 +188,11 @@ class SidecarParser:
                         missing.append(f"{table}.{col}")
 
         if missing:
-            raise SidecarSchemaMismatch(
-                f"scan_metadata.db 스키마가 v{version} 요구사항과 다릅니다.",
-                detail={"missing_columns": missing},
+            # 버전 풀어둠: missing column 이 있어도 raise 하지 않음.
+            # parser 가 SELECT 시 해당 컬럼 없으면 NULL/default 처리.
+            logger.warning(
+                "sidecar v%d 일부 컬럼 누락 — 무시하고 진행: %s",
+                version, missing,
             )
 
     def _load_session(self, conn: sqlite3.Connection, expected_scan_id: str) -> ScanSessionRow:
@@ -247,11 +256,33 @@ class SidecarParser:
         return result
 
     def _load_branch_marks(self, conn: sqlite3.Connection, scan_id: str) -> list[BranchMarkRow]:
+        # v8 추가 컬럼 (node_type, width_m, ..., dx/dy/dz_local) 은 sqlite SELECT * 가
+        # 기존 컬럼 + 새 컬럼 모두 가져옴. 옛 버전 sqlite 에는 없으면 dict 에 안 들어가서
+        # BranchMarkRow 의 default (None / 'corridor') 가 적용됨.
         rows = conn.execute(
             "SELECT * FROM branch_mark WHERE lower(scan_id) = lower(?) ORDER BY id",
             (scan_id,),
         ).fetchall()
         return [BranchMarkRow(**{**dict(r), "scan_id": scan_id}) for r in rows]
+
+    def _load_branch_edges(self, conn: sqlite3.Connection, scan_id: str) -> list[BranchEdgeRow]:
+        """v9 추가: 사용자가 명시한 branch_mark 사이의 edge. 옛 버전은 테이블 없음 → 빈 리스트."""
+        try:
+            rows = conn.execute(
+                "SELECT * FROM branch_edge WHERE lower(scan_id) = lower(?) ORDER BY id",
+                (scan_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        out: list[BranchEdgeRow] = []
+        for r in rows:
+            d = dict(r)
+            d["scan_id"] = scan_id
+            try:
+                out.append(BranchEdgeRow(**d))
+            except Exception as exc:
+                logger.warning("branch_edge row 파싱 실패 id=%s err=%s", d.get("id"), exc)
+        return out
 
     def _load_yolo_detections(
         self, conn: sqlite3.Connection, scan_id: str

@@ -48,6 +48,7 @@ class RouteService:
         merge_overlaps: bool = False,
         start: RouteEndpoint,
         goal: RouteEndpoint,
+        vertical_preference: str | None = None,
     ) -> RoutePath:
         """경로 탐색 진입점.
 
@@ -72,6 +73,7 @@ class RouteService:
             g, node_lookup, build_job_ids, merge_report = await self._loader.load_many(
                 scan_ids=effective_scan_ids,
                 merge_overlaps=merge_overlaps,
+                vertical_preference=vertical_preference,
             )
             build_job_id = build_job_ids[0]
             route_metadata = {
@@ -79,6 +81,7 @@ class RouteService:
                 "merge_overlaps": merge_overlaps,
                 "scan_count": len(effective_scan_ids),
                 "vertical_edge_count": int(g.graph.get("vertical_edge_count", 0)),
+                "vertical_preference": vertical_preference,
                 "merge_report": (
                     {
                         "fragment_count": merge_report.fragment_count,
