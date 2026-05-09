@@ -161,23 +161,45 @@ async def _backfill_table(
     table: sa.Table,
     by_seq: dict[int, tuple[bytes, float, float, float]],
 ) -> int:
+    """mark.pose 를 keyframe pose × local offset 으로 갱신.
+
+    keyframe_meta.pose 는 base→world (4x4 col-major bytes, 64B).
+    table 에 dx_local/dy_local/dz_local 컬럼 있으면 base frame offset 을 적용해서
+    정확한 world position 계산. 없으면 (또는 NULL) 카메라 pose 를 그대로.
+    """
+    import numpy as np
     if not by_seq:
         return 0
-    rows = (
-        await session.execute(
-            sa.select(table.c.id, table.c.keyframe_seq).where(table.c.scan_id == scan_id)
-        )
-    ).fetchall()
+    has_local = all(c in table.c for c in ("dx_local", "dy_local", "dz_local"))
+    select_cols = [table.c.id, table.c.keyframe_seq]
+    if has_local:
+        select_cols += [table.c.dx_local, table.c.dy_local, table.c.dz_local]
+    rows = (await session.execute(
+        sa.select(*select_cols).where(table.c.scan_id == scan_id)
+    )).fetchall()
 
     updated = 0
     for row in rows:
         kf = by_seq.get(row.keyframe_seq)
         if kf is None:
             continue
-        pose_matrix, tx, ty, tz = kf
+        pose_matrix, kf_tx, kf_ty, kf_tz = kf
+
+        dx = getattr(row, "dx_local", None) if has_local else None
+        dy = getattr(row, "dy_local", None) if has_local else None
+        dz = getattr(row, "dz_local", None) if has_local else None
+
+        if dx is not None and dy is not None and dz is not None and pose_matrix:
+            # pose_matrix 는 base→world 4x4 col-major 64B (16 float32).
+            T = np.frombuffer(pose_matrix, dtype=np.float32).reshape(4, 4, order="F")
+            local = np.array([dx, dy, dz, 1.0], dtype=np.float64)
+            world = (T.astype(np.float64) @ local)
+            tx, ty, tz = float(world[0]), float(world[1]), float(world[2])
+        else:
+            tx, ty, tz = kf_tx, kf_ty, kf_tz
+
         await session.execute(
-            sa.update(table)
-            .where(table.c.id == row.id)
+            sa.update(table).where(table.c.id == row.id)
             .values(pose_matrix=pose_matrix, tx=tx, ty=ty, tz=tz)
         )
         updated += 1
