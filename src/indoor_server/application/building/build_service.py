@@ -389,6 +389,26 @@ class BuildService:
             len(outcome.poi_world_poses),
         )
 
+        # v9 추가: 사용자가 명시한 branch_edge / branch_mark.corner 가 있으면
+        # floor polygon (GeoJSON) 빌드해서 storage 에 저장.
+        try:
+            await self._maybe_build_floor_polygon_v2(scan_id=scan_id, build_job_id=build_job_id)
+        except Exception as exc:
+            logger.warning(
+                "floor_polygon_v2 빌드 실패 scan_id=%s err=%s — graph 영향 없음",
+                scan_id, exc,
+            )
+
+        # SuperPoint cache warmup — server 측위 cold-start 제거.
+        # reprocessed.db 가 있으면 우선 사용.
+        try:
+            rtab_path = settings.storage_root / "scans" / scan_id / "rtabmap_reprocessed.db"
+            if not rtab_path.exists():
+                rtab_path = settings.storage_root / "scans" / scan_id / "rtabmap.db"
+            await self._warmup_superpoint(scan_id=scan_id, rtabmap_db_path=rtab_path)
+        except Exception as exc:
+            logger.warning("superpoint warmup trigger 실패 scan_id=%s err=%s", scan_id, exc)
+
     async def _load_keyframes(
         self, session: AsyncSession, scan_id: str
     ) -> list[KeyframeRef]:
