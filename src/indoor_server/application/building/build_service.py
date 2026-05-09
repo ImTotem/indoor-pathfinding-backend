@@ -483,9 +483,10 @@ class BuildService:
 
         실패 시 graceful degradation: log + raw db 그대로 build_pipeline 진입.
         """
-        # raw_arkit_recording: iOS RTABMap step1 결과를 서버가 reprocess.
-        # raw_video_recording: 우리 rtabmap_seeder 가 만든 db 도 reprocess (graph 일관성).
-        if manifest_mode not in ("raw_arkit_recording", "raw_video_recording"):
+        # raw_arkit_recording: iOS RTABMap step1 결과 → 서버 reprocess.
+        # raw_video_recording: rtabmap_seeder 가 만든 db → reprocess (depth 없음, RGB-only).
+        # live_rtabmap   : iOS 가 RGBD (image+depth+pose) RTABMap step1 → 서버 reprocess (RGBD).
+        if manifest_mode not in ("raw_arkit_recording", "raw_video_recording", "live_rtabmap"):
             return None
         if not self._reprocess_runner.is_available():
             logger.warning(
@@ -508,9 +509,12 @@ class BuildService:
                 "output_db_path": output_db,
             }
 
+        # live_rtabmap = depth 있어 RGBD reprocess. 다른 모드는 RGB-only.
+        rgbd_enabled = manifest_mode == "live_rtabmap"
         try:
             result = await self._reprocess_runner.run(
-                input_db=input_db, output_db=output_db
+                input_db=input_db, output_db=output_db,
+                rgbd_enabled=rgbd_enabled,
             )
         except RTABMapReprocessError as e:
             logger.warning(

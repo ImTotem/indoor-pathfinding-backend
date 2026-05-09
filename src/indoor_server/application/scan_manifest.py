@@ -111,6 +111,11 @@ class ScanManifest:
         """Sprint 67 — raw_video_recording 모드 여부."""
         return self.mode == "raw_video_recording"
 
+    @property
+    def is_live_rtabmap_mode(self) -> bool:
+        """Sprint 87 — live_rtabmap 모드 (iOS RGBD step1 결과 직접 업로드)."""
+        return self.mode == "live_rtabmap"
+
 
 def parse_manifest_file(path: Path, *, expected_scan_id: str) -> ScanManifest:
     """manifest.json 파일을 읽어 ScanManifest 로 반환.

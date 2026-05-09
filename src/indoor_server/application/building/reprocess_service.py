@@ -88,8 +88,17 @@ class RTABMapReprocessRunner:
         input_db: Path,
         output_db: Path,
         timeout_s: float | None = None,
+        rgbd_enabled: bool = False,
+        detector_strategy: int | None = None,
+        loop_thr: float = 0.11,
     ) -> ReprocessResult:
-        """rtabmap-reprocess 실행. SIFT 재추출 + post-processing 옵션 적용.
+        """rtabmap-reprocess 실행. visual feature 재추출 + graph optimization.
+
+        Args:
+            rgbd_enabled: depth 있는 db (live_rtabmap 모드) 면 True. RGBD loop closure 활성.
+            detector_strategy: None 이면 default (RGBD: 6=GFTT/BRIEF, RGB-only: SIFT).
+                sprint81 검증으로 단조 환경에선 6 이 효과 ↑.
+            loop_thr: 0.11 (sprint81 표준, default 보다 lenient — loop closure 검출 ↑).
 
         Raises:
             RTABMapReprocessError: binary 없음, exit code != 0, timeout.
@@ -102,14 +111,27 @@ class RTABMapReprocessRunner:
             raise RTABMapReprocessError(f"input db 가 없습니다: {input_db}")
 
         output_db.parent.mkdir(parents=True, exist_ok=True)
-        # 기존 output 이 있으면 덮어쓰기 위해 삭제 (rtabmap-reprocess 는 overwrite OK 이지만 안전).
         if output_db.exists():
             output_db.unlink()
 
+        # detector strategy: RGBD 면 GFTT/BRIEF (6, sprint81), 아니면 SIFT (1) default
+        ds = detector_strategy if detector_strategy is not None else (
+            6 if rgbd_enabled else self._feature_strategy
+        )
+
         args = [
             self._binary_path,
-            f"--Kp/DetectorStrategy={self._feature_strategy}",
-            f"--Vis/FeatureType={self._feature_strategy}",
+            "--Mem/IncrementalMemory", "true",
+            "--Mem/InitWMWithAllNodes", "true",
+            "--Reg/Strategy", "0",
+            "--Vis/EstimationType", "1",
+            "--Rtabmap/DetectionRate", "0",
+            "--Rtabmap/LoopThr", str(loop_thr),
+            "--Mem/STMSize", "30",
+            "--RGBD/Enabled", "true" if rgbd_enabled else "false",
+            f"--Kp/DetectorStrategy={ds}",
+            f"--Vis/FeatureType={ds}",
+            "--uwarn",
             str(input_db),
             str(output_db),
         ]
