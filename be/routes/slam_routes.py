@@ -243,8 +243,9 @@ async def localize_in_map_v3(
     images: list[UploadFile] = File(..., description="위치 추정에 사용할 이미지 파일 목록"),
     building_id: str | None = Form(None, description="건물 ID. 이 값으로 활성 floor map을 조회합니다."),
     map_id: str | None = Form(None, description="기존 클라이언트 호환용 ID. building_id와 동일하게 처리합니다."),
+    floor_id: str | None = Form(None, description="선택 층 ID. 없으면 전체 층에서 탐색합니다."),
 ) -> SLAMLocalizeResponse:
-    return await _localize_uploads(building_id=building_id, map_id=map_id, images=images)
+    return await _localize_uploads(building_id=building_id, map_id=map_id, images=images, floor_id=floor_id)
 
 
 @router.post(
@@ -346,6 +347,7 @@ async def _localize_uploads(
     map_id: str | None,
     images: list[UploadFile],
     mask_persons: bool = False,
+    floor_id: str | None = None,
 ) -> SLAMLocalizeResponse:
     resolved_building_id = _coerce_building_id(building_id, map_id)
     image_bytes_list = await _read_upload_images(images)
@@ -369,6 +371,7 @@ async def _localize_uploads(
         building_id=resolved_building_id,
         image_bytes_list=image_bytes_list,
         mask_persons=mask_persons,
+        floor_id=floor_id,
     )
 
 
@@ -376,6 +379,7 @@ async def _localize_impl(
     request: SLAMLocalizeRequest,
     mask_persons: bool = False,
     engine=None,
+    floor_id: str | None = None,
 ) -> SLAMLocalizeResponse:
     """Compatibility core for internal callers that still pass base64 JSON."""
 
@@ -391,6 +395,7 @@ async def _localize_impl(
         image_bytes_list=image_bytes_list,
         mask_persons=mask_persons,
         engine=engine,
+        floor_id=floor_id,
     )
 
 
@@ -400,8 +405,9 @@ async def _localize_bytes(
     image_bytes_list: list[bytes],
     mask_persons: bool = False,
     engine=None,
+    floor_id: str | None = None,
 ) -> SLAMLocalizeResponse:
-    logger.info(f"[SLAM-LOCALIZE] building_id: {building_id}, mask_persons: {mask_persons}")
+    logger.info(f"[SLAM-LOCALIZE] building_id: {building_id}, mask_persons: {mask_persons}, floor_id: {floor_id}")
 
     if not image_bytes_list:
         raise HTTPException(status_code=422, detail="At least one image file is required")
@@ -420,6 +426,8 @@ async def _localize_bytes(
             ]
         else:
             raise HTTPException(status_code=404, detail=f"No maps found for building {building_id}")
+
+    floor_maps = _filter_floor_maps(floor_maps, floor_id=floor_id, building_id=building_id)
 
     slam_engine = engine
     if slam_engine is None:
@@ -651,6 +659,34 @@ def _coerce_building_id(building_id: str | None, map_id: str | None) -> str:
     if not resolved:
         raise HTTPException(status_code=422, detail="building_id or map_id form field is required")
     return resolved
+
+
+def _filter_floor_maps(
+    floor_maps: list[dict],
+    *,
+    floor_id: str | None,
+    building_id: str,
+) -> list[dict]:
+    floor_id = (floor_id or "").strip()
+    if not floor_id:
+        return floor_maps
+
+    filtered = [
+        fm for fm in floor_maps
+        if floor_id in {
+            str(fm.get("floor_id") or ""),
+            str(fm.get("scan_id") or ""),
+        }
+    ]
+
+    if not filtered:
+        detail = {
+            "message": "No map found for selected floor",
+            "building_id": building_id,
+            "floor_id": floor_id,
+        }
+        raise HTTPException(status_code=404, detail=detail)
+    return filtered
 
 
 def _resolve_floor_path(floor_map: dict) -> dict:
