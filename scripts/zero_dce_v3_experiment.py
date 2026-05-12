@@ -6,7 +6,7 @@ Usage:
         --dark ./dark.jpg \
         --bright ./bright.jpg \
         --building-id f9693bd8-fbff-41b9-be88-cd4b0af3690a \
-        --base-url http://localhost:5000
+        --base-url http://localhost:8080
 
 Outputs:
     response/zero_dce_v3_YYYYMMDD_HHMMSS/
@@ -15,14 +15,21 @@ Outputs:
         bright_reference.jpg
         comparison.jpg
         metrics.json
-        v3_dark_original.json
-        v3_dark_zero_dce.json
-        v3_bright_reference.json
+        v3_debug_dark_original.json
+        v3_debug_dark_original_matches.jpg
+        v3_debug_dark_zero_dce.json
+        v3_debug_dark_zero_dce_matches.jpg
+        v3_debug_bright_reference.json
+        v3_debug_bright_reference_matches.jpg
+        localize_dark_original.json
+        localize_dark_zero_dce.json
+        localize_bright_reference.json
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 from datetime import datetime
 from pathlib import Path
@@ -36,10 +43,10 @@ from PIL import Image, ImageDraw, ImageOps
 
 
 def _default_weights_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[1]  # be2/
+    repo_root = Path(__file__).resolve().parent
     workspace_root = repo_root.parent
     candidates = [
-        repo_root / "be/slam_engines/rtabmap/weights/zero_dce.pth",
+        repo_root / "weights/zero_dce.pth",
         workspace_root / "be/slam_engines/rtabmap/weights/zero_dce.pth",
     ]
     for path in candidates:
@@ -140,11 +147,10 @@ def post_v3_localize(
     image_path: Path,
     timeout: int,
 ) -> dict[str, Any]:
-    url = base_url.rstrip("/") + "/api/slam/v3/localize"
+    url = base_url.rstrip("/") + f"/api/v1/buildings/{building_id}/localize"
     with image_path.open("rb") as f:
         response = requests.post(
             url,
-            data={"building_id": building_id, "map_id": building_id},
             files=[("images", (image_path.name, f, "image/jpeg"))],
             timeout=timeout,
         )
@@ -161,18 +167,93 @@ def post_v3_localize(
     return result
 
 
+def post_v3_match_debug(
+    base_url: str,
+    building_id: str,
+    image_path: Path,
+    timeout: int,
+) -> dict[str, Any]:
+    url = base_url.rstrip("/") + "/api/slam/v3/debug/matches"
+    with image_path.open("rb") as f:
+        response = requests.post(
+            url,
+            data={"building_id": building_id, "map_id": building_id},
+            files=[("image", (image_path.name, f, "image/jpeg"))],
+            timeout=timeout,
+        )
+
+    result: dict[str, Any] = {
+        "status_code": response.status_code,
+        "endpoint": url,
+        "image": str(image_path),
+    }
+    try:
+        result["body"] = response.json()
+    except Exception:
+        result["body"] = response.text[:1000]
+    return result
+
+
+def _image_b64_to_bytes(value: str) -> bytes:
+    if "," in value:
+        value = value.split(",", 1)[1]
+    return base64.b64decode(value)
+
+
+def save_match_debug_artifacts(out_dir: Path, label: str, result: dict[str, Any]) -> dict[str, Any]:
+    body = result.get("body")
+    if not isinstance(body, dict) or result["status_code"] != 200:
+        return result
+
+    saved_files: dict[str, str] = {}
+    for key, suffix in [
+        ("query_b64", "query.jpg"),
+        ("matches_b64", "matches.jpg"),
+        ("db_frame_b64", "db_frame.jpg"),
+    ]:
+        value = body.get(key)
+        if not value:
+            continue
+        path = out_dir / f"v3_debug_{label}_{suffix}"
+        path.write_bytes(_image_b64_to_bytes(value))
+        saved_files[key] = str(path)
+
+    stripped_body = {k: v for k, v in body.items() if not k.endswith("_b64")}
+    stripped_body["saved_files"] = saved_files
+    return {**result, "body": stripped_body}
+
+
 def save_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def print_match_debug_summary(label: str, result: dict[str, Any]) -> None:
+    body = result.get("body")
+    print(f"\n[v3_debug:{label}] status={result['status_code']}")
+    if result["status_code"] != 200:
+        print(f"  error          : {body}")
+    elif isinstance(body, dict):
+        print(f"  best_node_id   : {body.get('best_node_id')}")
+        print(f"  good_matches   : {body.get('num_good_matches')}")
+        print(f"  node_matches   : {body.get('num_node_matches')}")
+        print(f"  floorId        : {body.get('floor_id')}")
+        print(f"  floorName      : {body.get('floor_name')}")
+        print(f"  has_db_image   : {body.get('has_db_image')}")
+    else:
+        print(f"  body           : {body}")
 
 
 def print_localize_summary(label: str, result: dict[str, Any]) -> None:
     body = result.get("body")
     print(f"\n[{label}] status={result['status_code']}")
-    if isinstance(body, dict):
+    if result["status_code"] != 200:
+        print(f"  error      : {body}")
+    elif isinstance(body, dict):
         print(f"  confidence : {body.get('confidence')}")
         print(f"  numMatches : {body.get('numMatches')}")
+        print(f"  mapId      : {body.get('mapId')}")
         print(f"  floorId    : {body.get('floorId')}")
-        print(f"  floorLevel : {body.get('floorLevel')}")
+        print(f"  floorLevel : {body.get('floorLevel') or (body.get('pose') or {}).get('floorLevel')}")
         print(f"  pose       : {body.get('pose')}")
     else:
         print(f"  body       : {body}")
@@ -183,7 +264,7 @@ def main() -> None:
     parser.add_argument("--dark", required=True, type=Path, help="저조도 입력 이미지")
     parser.add_argument("--bright", required=True, type=Path, help="밝은 기준 이미지")
     parser.add_argument("--building-id", "--map-id", required=True, dest="building_id")
-    parser.add_argument("--base-url", default="http://localhost:5000")
+    parser.add_argument("--base-url", default="http://localhost:8080")
     parser.add_argument("--weights", type=Path, default=_default_weights_path())
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--skip-localize", action="store_true")
@@ -230,13 +311,23 @@ def main() -> None:
     if args.skip_localize:
         return
 
+    debug_results = {
+        "dark_original": post_v3_match_debug(args.base_url, args.building_id, dark_path, args.timeout),
+        "dark_zero_dce": post_v3_match_debug(args.base_url, args.building_id, enhanced_path, args.timeout),
+        "bright_reference": post_v3_match_debug(args.base_url, args.building_id, bright_path, args.timeout),
+    }
+    for name, result in debug_results.items():
+        saved_result = save_match_debug_artifacts(out_dir, name, result)
+        save_json(out_dir / f"v3_debug_{name}.json", saved_result)
+        print_match_debug_summary(name, saved_result)
+
     results = {
         "dark_original": post_v3_localize(args.base_url, args.building_id, dark_path, args.timeout),
         "dark_zero_dce": post_v3_localize(args.base_url, args.building_id, enhanced_path, args.timeout),
         "bright_reference": post_v3_localize(args.base_url, args.building_id, bright_path, args.timeout),
     }
     for name, result in results.items():
-        save_json(out_dir / f"v3_{name}.json", result)
+        save_json(out_dir / f"localize_{name}.json", result)
         print_localize_summary(name, result)
 
 
