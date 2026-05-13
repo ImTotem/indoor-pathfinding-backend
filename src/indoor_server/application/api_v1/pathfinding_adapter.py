@@ -1,6 +1,7 @@
 """V1 pathfinding adapter over the existing RouteService."""
 from __future__ import annotations
 
+import logging
 import math
 from uuid import UUID
 
@@ -14,6 +15,7 @@ from indoor_server.application.api_v1.errors import V1ServiceError
 from indoor_server.application.api_v1.poi_catalog_service import POICatalogService
 from indoor_server.application.routing.graph_loader import GraphLoader
 from indoor_server.application.routing.route_service import RouteService
+from indoor_server.domain.building.enums import BuildState
 from indoor_server.domain.routing.errors import (
     EndpointNodeNotFoundError,
     GraphNotReadyError,
@@ -23,6 +25,9 @@ from indoor_server.domain.routing.errors import (
     SnapDistanceExceededError,
 )
 from indoor_server.domain.routing.models import MapNodeRow
+from indoor_server.infrastructure.db.repositories.build_job_repo import BuildJobRepository
+
+_log = logging.getLogger(__name__)
 from indoor_server.interfaces.api.schemas import RouteEndpoint
 from indoor_server.interfaces.api.v1_schemas import (
     CoordinatePoint,
@@ -52,18 +57,8 @@ class PathfindingAdapter:
         if not scans:
             raise V1ServiceError(404, "ACTIVE_SCAN_NOT_FOUND", "building has no active scans")
 
-        # 시작 scan 자동 결정 — startScanId 우선, fallback: startFloorLevel.
-        if request.start_scan_id is not None:
-            scan_id_str = str(request.start_scan_id)
-            start_scan = next((s for s in scans if s.scan_id == scan_id_str), None)
-            if start_scan is None:
-                raise V1ServiceError(
-                    404,
-                    "START_SCAN_NOT_FOUND",
-                    "startScanId is not active in this building.",
-                    {"startScanId": scan_id_str},
-                )
-        elif request.start_floor_level is not None:
+        # 시작 scan 자동 결정. start_floor_level override 없으면 좌표 z 기반.
+        if request.start_floor_level is not None:
             start_scan = _scan_for_level(scans, request.start_floor_level)
             if start_scan is None:
                 raise V1ServiceError(
@@ -73,11 +68,7 @@ class PathfindingAdapter:
                     {"startFloorLevel": request.start_floor_level},
                 )
         else:
-            raise V1ServiceError(
-                422,
-                "START_NOT_SPECIFIED",
-                "either startScanId or startFloorLevel is required.",
-            )
+            start_scan = _scan_for_z(scans, request.start_z)
 
         goal = await POICatalogService(self._session).destination_endpoint(
             building_id=building_id,
@@ -86,11 +77,20 @@ class PathfindingAdapter:
         start = RouteEndpoint(
             coordinate=(request.start_x, request.start_y, request.start_z),
         )
+
+        # Multi-scan A* requires every fragment to have a SUCCEEDED build,
+        # otherwise GraphNotReady poisons the whole compute. Filter unbuilt
+        # active scans (e.g. floors whose only active scan is OPEN with no
+        # build_job yet) so cross-floor routing still works for floors that
+        # *are* built. The user-selected start_scan is kept regardless — if
+        # its graph isn't ready we surface that as the error, which is right.
+        built_scan_ids = await self._filter_built_scan_ids(scans, start_scan.scan_id)
+
         route_service = RouteService(GraphLoader(self._session))
         try:
             route = await route_service.compute(
                 scan_id=start_scan.scan_id,
-                scan_ids=[scan.scan_id for scan in scans],
+                scan_ids=built_scan_ids,
                 merge_overlaps=False,
                 start=start,
                 goal=goal,
@@ -126,6 +126,38 @@ class PathfindingAdapter:
             floor_transitions=_floor_transitions(route.nodes_in_order, level_by_scan_id),
             route_metadata=metadata,
         )
+
+    async def _filter_built_scan_ids(
+        self,
+        scans: list[ActiveScan],
+        start_scan_id: str,
+    ) -> list[str]:
+        """active scans 중 latest build = SUCCEEDED 인 것만 반환.
+
+        start_scan_id 는 무조건 포함 (built 가 아니면 GraphLoader 가
+        GraphNotReadyError 를 던져 사용자 입장에서 명확한 에러로 표면화).
+        """
+        repo = BuildJobRepository(self._session)
+        built: list[str] = []
+        skipped: list[tuple[str, int, str | None]] = []
+        for scan in scans:
+            latest = await repo.get_latest(scan.scan_id)
+            ok = latest is not None and latest.state == BuildState.SUCCEEDED
+            if ok:
+                built.append(scan.scan_id)
+            else:
+                skipped.append(
+                    (scan.scan_id, scan.floor_level, latest.state.value if latest else None)
+                )
+        if start_scan_id not in built:
+            built.insert(0, start_scan_id)
+        if skipped:
+            _log.info(
+                "pathfinding: %d active scan(s) skipped (no SUCCEEDED build): %s",
+                len(skipped),
+                [(sid[:12], lvl, st) for sid, lvl, st in skipped],
+            )
+        return built
 
     async def compute_floor_coordinate_route(
         self,
@@ -196,6 +228,20 @@ def _scan_for_level(scans: list[ActiveScan], floor_level: int) -> ActiveScan | N
     return None
 
 
+def _scan_for_z(scans: list[ActiveScan], z: float, floor_height_m: float = 3.0) -> ActiveScan:
+    """좌표 z → 가장 가까운 floor 의 active scan.
+
+    각 floor 의 expected z = floor_level * floor_height_m (1층 기준 z=0).
+    실제 ARKit world frame 별 origin 차이가 있어 정확하지 않을 수 있으나,
+    snap 단계가 multi-scan node 후보 중 nearest 를 다시 고르므로 시작 scan 잘못
+    잡혀도 cross-floor edge 로 도달 가능. tie 면 floor_level=1 (지상층) 우선.
+    """
+    def key(scan: ActiveScan) -> tuple[float, int]:
+        expected_z = (scan.floor_level - 1) * floor_height_m
+        return (abs(z - expected_z), abs(scan.floor_level - 1))
+    return min(scans, key=key)
+
+
 def _coordinate_endpoint(point: CoordinatePoint) -> RouteEndpoint:
     return RouteEndpoint(coordinate=(point.x, point.y, point.z))
 
@@ -255,12 +301,16 @@ def _step_response(
     level_by_scan_id: dict[str, int],
 ) -> PathStepResponse:
     floor_level = _floor_level_for_node(node, level_by_scan_id)
-    label = node.label or node.node_type
+    if node.node_type == "virtual_snap":
+        instruction = "Start."
+    else:
+        label = node.label or node.node_type
+        instruction = f"Proceed to {label}."
     return PathStepResponse(
         step_number=index,
         floor_level=floor_level,
         position=V1Position(x=node.x, y=node.y, z=node.z, floor_level=floor_level),
-        instruction=f"Proceed to {label}.",
+        instruction=instruction,
         node_id=node.node_id,
     )
 

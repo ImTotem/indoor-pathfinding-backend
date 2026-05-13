@@ -11,6 +11,7 @@ import struct
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -20,7 +21,7 @@ import torch
 from utils import logger
 
 MAX_CACHED_MAPS = 5
-TOP_K = 5
+TOP_K = 30
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,12 @@ def _parse_node_transforms(conn: sqlite3.Connection) -> Dict[int, np.ndarray]:
             continue
         result[node_id] = np.array(vals, dtype=np.float64).reshape(3, 4)
     return result
+
+
+def _to_homogeneous_pose(transform_3x4: np.ndarray) -> np.ndarray:
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, :] = transform_3x4
+    return pose
 
 
 def _load_world_features(
@@ -189,7 +196,14 @@ def _smart_select_keyframes(
 class SuperPointLoadedMap:
     """SuperPoint feature index for all keyframes in one RTABMap DB."""
 
-    def __init__(self, map_id: str, db_path: str, device: torch.device):
+    def __init__(
+        self,
+        map_id: str,
+        db_path: str,
+        device: torch.device,
+        *,
+        skip_build: bool = False,
+    ):
         self.map_id = map_id
         self.db_path = db_path
         self.device = device
@@ -199,10 +213,16 @@ class SuperPointLoadedMap:
         self.keyframe_feats: Dict[int, dict] = {}
         # (N, 3) world 3D per keyframe keypoint; NaN where unavailable
         self.keyframe_world3d: Dict[int, np.ndarray] = {}
+        # RTAB-Map Node.pose, base_link -> world, homogeneous 4x4.
+        self.node_poses: Dict[int, np.ndarray] = {}
         # (K, 256) mean descriptors for global retrieval
         self.global_descs: Optional[torch.Tensor] = None
+        # DB calibration — base→optical (3x3) frame 변환 매트릭스. localize 시 응답 R 변환에 사용.
+        self.optical_to_base: Optional[np.ndarray] = None
+        self.base_to_optical: Optional[np.ndarray] = None
 
-        self._build_index()
+        if not skip_build:
+            self._build_index()
 
     def _build_index(self):
         from lightglue import SuperPoint
@@ -217,7 +237,24 @@ class SuperPointLoadedMap:
             ).fetchall()]
 
             transforms = _parse_node_transforms(conn)
+            self.node_poses = {
+                nid: _to_homogeneous_pose(T34) for nid, T34 in transforms.items()
+            }
             world_feats = _load_world_features(conn, transforms)
+
+            # DB calibration 의 base→optical 매트릭스 캐싱 (localize 시 응답 R 변환에 사용).
+            # device 별로 sensor mounting / orientation 다를 수 있어 하드코딩 금지.
+            if all_ids:
+                calib_row = conn.execute(
+                    "SELECT calibration FROM Data WHERE id=? LIMIT 1", (all_ids[0],)
+                ).fetchone()
+                if calib_row and calib_row[0]:
+                    try:
+                        _K, lt = _parse_calibration_K_and_local(bytes(calib_row[0]))
+                        self.optical_to_base = lt[:3, :3].astype(np.float64)
+                        self.base_to_optical = self.optical_to_base
+                    except Exception as exc:
+                        logger.warning(f"[SuperPoint] optical_to_base parse failed: {exc}")
 
             global_descs: List[torch.Tensor] = []
             from .global_descriptor import GlobalDescExtractor
@@ -264,27 +301,51 @@ class SuperPointLoadedMap:
             1 for v in self.keyframe_world3d.values()
             if not np.all(np.isnan(v))
         )
+        valid_ratios = [
+            float(np.count_nonzero(~np.isnan(v).any(axis=1)) / max(len(v), 1))
+            for v in self.keyframe_world3d.values()
+        ]
+        median_valid_ratio = float(np.median(valid_ratios)) if valid_ratios else 0.0
         logger.info(
             f"[SuperPoint] Map '{self.map_id}' indexed in {time.time()-t0:.1f}s: "
-            f"{len(self.node_ids)} frames, {n_with_3d} with 3D coverage"
+            f"{len(self.node_ids)} frames, {n_with_3d} with 3D coverage "
+            f"(median valid kp ratio={median_valid_ratio:.3f})"
         )
 
         # Fallback: RTAB-Map Feature 에 depth 가 없어 3D coverage 가 0 인 경우
-        # 이웃 keyframe pair multi-view triangulation 으로 world 3D 추정
-        if n_with_3d == 0 and len(self.node_ids) >= 2:
-            logger.info(
-                "[SuperPoint] No depth coverage from RTAB-Map — running multi-view triangulation"
-            )
+        # 1) Data 테이블의 depth blob (iOS LiDAR) 우선 사용 — sensor-level 정확도, 즉시.
+        # 2) depth blob 없으면 multi-view triangulation 으로 fallback.
+        if (n_with_3d == 0 or median_valid_ratio < 0.45) and len(self.node_ids) >= 1:
             t1 = time.time()
-            self._triangulate_via_multi_view()
-            n_with_3d = sum(
-                1 for v in self.keyframe_world3d.values()
-                if not np.all(np.isnan(v))
-            )
-            logger.info(
-                f"[SuperPoint] Triangulation done in {time.time()-t1:.1f}s: "
-                f"{n_with_3d}/{len(self.node_ids)} frames with 3D coverage"
-            )
+            n_filled = self._fill_3d_from_depth_blob()
+            if n_filled > 0:
+                n_with_3d = sum(
+                    1 for v in self.keyframe_world3d.values()
+                    if not np.all(np.isnan(v))
+                )
+                valid_ratios = [
+                    float(np.count_nonzero(~np.isnan(v).any(axis=1)) / max(len(v), 1))
+                    for v in self.keyframe_world3d.values()
+                ]
+                median_valid_ratio = float(np.median(valid_ratios)) if valid_ratios else 0.0
+                logger.info(
+                    f"[SuperPoint] RGBD depth lookup done in {time.time()-t1:.1f}s: "
+                    f"{n_with_3d}/{len(self.node_ids)} frames with 3D coverage "
+                    f"(median valid kp ratio={median_valid_ratio:.3f})"
+                )
+            elif len(self.node_ids) >= 2:
+                logger.info(
+                    "[SuperPoint] No depth blob — running multi-view triangulation"
+                )
+                self._triangulate_via_multi_view()
+                n_with_3d = sum(
+                    1 for v in self.keyframe_world3d.values()
+                    if not np.all(np.isnan(v))
+                )
+                logger.info(
+                    f"[SuperPoint] Triangulation done in {time.time()-t1:.1f}s: "
+                    f"{n_with_3d}/{len(self.node_ids)} frames with 3D coverage"
+                )
 
             # ML depth fill — 실험적. NaN 은 줄지만 PnP inliers 안 늘어 측위 정확도 역효과.
             # opt-in: env INDOOR_ENABLE_ML_DEPTH_FILL=1 일 때만 활성.
@@ -301,6 +362,90 @@ class SuperPointLoadedMap:
                     logger.warning(
                         f"[SuperPoint] ML depth fill skipped: {type(exc).__name__}: {exc}"
                     )
+
+    def _fill_3d_from_depth_blob(
+        self,
+        min_depth_m: float = 0.2,
+        max_depth_m: float = 15.0,
+    ) -> int:
+        """Data.depth blob (iOS LiDAR) 사용해서 SuperPoint kp 3D world 좌표 직접 lookup.
+
+        iOS RTABMap 의 depth 는 PNG 으로 압축된 (H, W, 4) uint8 = float32 단일 채널 (m 단위).
+        SuperPoint kp 좌표 (RGB image frame) → depth image frame 으로 scale → depth lookup.
+        (u, v, d) → camera optical 3D → world (Node.pose @ base→optical inverse).
+
+        Returns: 3D 채워진 keyframe 개수.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            transforms = _parse_node_transforms(conn)
+            calib_row = conn.execute(
+                "SELECT calibration FROM Data WHERE id=? LIMIT 1",
+                (self.node_ids[0],),
+            ).fetchone()
+            if not calib_row or not calib_row[0]:
+                return 0
+            K, local_transform = _parse_calibration_K_and_local(bytes(calib_row[0]))
+            M_oc_to_base = local_transform[:3, :3]  # optical → base/local
+            fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+            n_filled = 0
+            for nid in self.node_ids:
+                if nid not in transforms:
+                    continue
+                row = conn.execute(
+                    "SELECT depth FROM Data WHERE id=?", (nid,)
+                ).fetchone()
+                if not row or not row[0]:
+                    continue
+
+                # decode iOS depth: PNG → (H, W, 4) uint8 → reinterpret float32 (H, W)
+                arr = np.frombuffer(bytes(row[0]), dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+                if img is None or img.ndim != 3 or img.shape[2] != 4:
+                    continue
+                depth = img.view(np.float32).reshape(img.shape[0], img.shape[1])
+                depth_h, depth_w = depth.shape
+
+                # SuperPoint kp 의 RGB image dim (extract 시 image_size 저장됨)
+                kp = self.keyframe_feats[nid]['keypoints'][0].cpu().numpy()  # (N, 2) in RGB frame
+                rgb_size = self.keyframe_feats[nid]['image_size'][0].cpu().numpy()  # (W, H)
+                rgb_w, rgb_h = float(rgb_size[0]), float(rgb_size[1])
+
+                # depth scale (RGB → depth coord)
+                sx = depth_w / rgb_w
+                sy = depth_h / rgb_h
+
+                # Node.pose: base→world (3x4 row-major)
+                T_b_w = transforms[nid]
+                R_b_w = T_b_w[:, :3]
+                t_b_w = T_b_w[:, 3]
+
+                w3d = np.full((len(kp), 3), float('nan'), dtype=np.float32)
+                for i, (u_rgb, v_rgb) in enumerate(kp):
+                    u_d = int(round(u_rgb * sx))
+                    v_d = int(round(v_rgb * sy))
+                    if not (0 <= u_d < depth_w and 0 <= v_d < depth_h):
+                        continue
+                    d = float(depth[v_d, u_d])
+                    if d < min_depth_m or d > max_depth_m or not np.isfinite(d):
+                        continue
+                    # (u, v, d) → 3D in optical camera frame
+                    x_oc = (u_rgb - cx) / fx * d
+                    y_oc = (v_rgb - cy) / fy * d
+                    z_oc = d
+                    p_oc = np.array([x_oc, y_oc, z_oc], dtype=np.float64)
+                    # optical → base → world
+                    p_base = M_oc_to_base @ p_oc
+                    p_world = R_b_w @ p_base + t_b_w
+                    w3d[i] = p_world.astype(np.float32)
+
+                self.keyframe_world3d[nid] = w3d
+                if not np.all(np.isnan(w3d)):
+                    n_filled += 1
+            return n_filled
+        finally:
+            conn.close()
 
     def _triangulate_via_multi_view(
         self,
@@ -329,7 +474,8 @@ class SuperPointLoadedMap:
                 logger.warning("[SuperPoint] No calibration in Data — skipping triangulation")
                 return
             K, local_transform = _parse_calibration_K_and_local(bytes(calib_row[0]))
-            C = local_transform[:3, :3]  # base → optical (3x3)
+            C = local_transform[:3, :3]  # optical → base/local (3x3)
+            base_to_optical = C.T
         finally:
             conn.close()
 
@@ -352,8 +498,8 @@ class SuperPointLoadedMap:
                 T_bi_w[:3, :] = transforms[nid_i]
                 T_w_bi = np.linalg.inv(T_bi_w)
                 # world → optical_i
-                R_wo_i = C @ T_w_bi[:3, :3]
-                t_wo_i = C @ T_w_bi[:3, 3]
+                R_wo_i = base_to_optical @ T_w_bi[:3, :3]
+                t_wo_i = base_to_optical @ T_w_bi[:3, 3]
                 P_i = K @ np.hstack([R_wo_i, t_wo_i.reshape(3, 1)])
 
                 feats_i = {k: v.to(self.device) for k, v in self.keyframe_feats[nid_i].items()}
@@ -369,8 +515,8 @@ class SuperPointLoadedMap:
                     T_bj_w = np.eye(4, dtype=np.float64)
                     T_bj_w[:3, :] = transforms[nid_j]
                     T_w_bj = np.linalg.inv(T_bj_w)
-                    R_wo_j = C @ T_w_bj[:3, :3]
-                    t_wo_j = C @ T_w_bj[:3, 3]
+                    R_wo_j = base_to_optical @ T_w_bj[:3, :3]
+                    t_wo_j = base_to_optical @ T_w_bj[:3, 3]
                     P_j = K @ np.hstack([R_wo_j, t_wo_j.reshape(3, 1)])
 
                     feats_j = {k: v.to(self.device) for k, v in self.keyframe_feats[nid_j].items()}
@@ -458,6 +604,7 @@ class SuperPointLoadedMap:
                 raise RuntimeError("calibration BLOB missing")
             K, local_transform = _parse_calibration_K_and_local(bytes(calib_row[0]))
             C = local_transform[:3, :3]
+            base_to_optical = C.T
         finally:
             conn.close()
 
@@ -494,8 +641,8 @@ class SuperPointLoadedMap:
             T_b_w = np.eye(4, dtype=np.float64)
             T_b_w[:3, :] = transforms[nid]
             T_w_b = np.linalg.inv(T_b_w)
-            R_wo = C @ T_w_b[:3, :3]
-            t_wo = C @ T_w_b[:3, 3]
+            R_wo = base_to_optical @ T_w_b[:3, :3]
+            t_wo = base_to_optical @ T_w_b[:3, 3]
 
             kps = self.keyframe_feats[nid]['keypoints'][0].cpu().numpy().astype(np.float32)
             world3d = self.keyframe_world3d[nid]
@@ -685,14 +832,225 @@ class SuperPointMapManager:
                     self._maps.move_to_end(map_id)
                     return cached
 
+            # Disk cache hit before falling back to a 26s rebuild from
+            # rtabmap.db. Survives uvicorn --reload and process restart.
+            disk_loaded = _try_load_disk_cache(map_id, db_path, self._device)
+            if disk_loaded is not None:
+                self._maps[map_id] = disk_loaded
+                while len(self._maps) > MAX_CACHED_MAPS:
+                    evicted, _ = self._maps.popitem(last=False)
+                    logger.info(f"[SuperPoint] Evicted map '{evicted}' from cache")
+                return disk_loaded
+
             m = SuperPointLoadedMap(map_id, db_path, self._device)
             try:
                 import os
                 m._db_mtime = os.path.getmtime(db_path)
             except Exception:
                 m._db_mtime = None
+            # Persist to disk so the next process / reload can mmap it.
+            try:
+                _save_disk_cache(m)
+            except Exception as exc:
+                logger.warning(
+                    f"[SuperPoint] disk cache save failed map='{map_id}' err={exc}"
+                )
             self._maps[map_id] = m
             while len(self._maps) > MAX_CACHED_MAPS:
                 evicted, _ = self._maps.popitem(last=False)
                 logger.info(f"[SuperPoint] Evicted map '{evicted}' from cache")
             return m
+
+
+# ─── persistent disk cache (safetensors + sidecar JSON) ──────────────────────
+# Layout per floor under config.settings.SUPERPOINT_CACHE_DIR:
+#   <map_id>.safetensors  — tensor bundle (stacked across all keyframes)
+#   <map_id>.json         — schema_version, source db mtime, node_poses,
+#                            node_offsets, calibration matrices, etc.
+# Invalidation: sidecar.source_db_mtime != current rtabmap.db mtime → rebuild.
+
+_CACHE_SCHEMA_VERSION = 1
+
+
+def _floor_cache_paths(map_id: str) -> tuple[Path, Path]:
+    from config.settings import settings as _slam_settings
+    cache_dir = Path(_slam_settings.SUPERPOINT_CACHE_DIR)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return (
+        cache_dir / f"{map_id}.safetensors",
+        cache_dir / f"{map_id}.json",
+    )
+
+
+def _try_load_disk_cache(
+    map_id: str, db_path: str, device: torch.device,
+) -> Optional["SuperPointLoadedMap"]:
+    """Return a fully-populated SuperPointLoadedMap from disk cache if the
+    sidecar's recorded source_db_mtime matches the current rtabmap.db, else
+    None (caller falls back to rebuild)."""
+    import json
+    import os
+    import time
+
+    bundle_path, sidecar_path = _floor_cache_paths(map_id)
+    if not bundle_path.exists() or not sidecar_path.exists():
+        return None
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"[SuperPoint] sidecar parse failed map='{map_id}': {exc}")
+        return None
+    if sidecar.get("schema_version") != _CACHE_SCHEMA_VERSION:
+        logger.info(
+            f"[SuperPoint] disk cache schema mismatch map='{map_id}' — rebuild"
+        )
+        return None
+    if sidecar.get("source_db_path") != str(db_path):
+        return None
+    try:
+        current_mtime = os.path.getmtime(db_path)
+    except OSError:
+        return None
+    if abs(sidecar.get("source_db_mtime", -1.0) - current_mtime) > 1e-3:
+        logger.info(
+            f"[SuperPoint] disk cache mtime mismatch map='{map_id}' — rebuild"
+        )
+        return None
+
+    t0 = time.time()
+    from safetensors.torch import load_file as _load_safetensors
+
+    tensors = _load_safetensors(str(bundle_path), device="cpu")
+
+    m = SuperPointLoadedMap(map_id, str(db_path), device, skip_build=True)
+    try:
+        m._db_mtime = current_mtime  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    node_ids = [int(x) for x in sidecar["node_ids"]]
+    offsets = [int(x) for x in sidecar["node_offsets"]]
+    image_sizes = tensors["image_sizes"]  # (K, 2)
+    kpts_all = tensors["keypoints"]       # (total_N, 2)
+    desc_all = tensors["descriptors"].to(torch.float32)  # fp16 → fp32
+    world3d_all = tensors["keypoints_world3d"].numpy()    # (total_N, 3)
+
+    m.node_ids = list(node_ids)
+    for idx, nid in enumerate(node_ids):
+        a, b = offsets[idx], offsets[idx + 1]
+        m.keyframe_feats[nid] = {
+            "keypoints": kpts_all[a:b].unsqueeze(0),       # (1, N, 2)
+            "descriptors": desc_all[a:b].unsqueeze(0),      # (1, N, 256)
+            "image_size": image_sizes[idx : idx + 1],       # (1, 2)
+        }
+        m.keyframe_world3d[nid] = world3d_all[a:b].copy()
+
+    if "global_descs" in tensors:
+        m.global_descs = tensors["global_descs"]
+
+    np_node_poses = sidecar.get("node_poses", {})
+    m.node_poses = {
+        int(k): np.array(v, dtype=np.float64) for k, v in np_node_poses.items()
+    }
+    if "optical_to_base" in tensors:
+        m.optical_to_base = tensors["optical_to_base"].numpy().astype(np.float64)
+    if "base_to_optical" in tensors:
+        m.base_to_optical = tensors["base_to_optical"].numpy().astype(np.float64)
+
+    logger.info(
+        f"[SuperPoint] disk cache loaded map='{map_id}' frames={len(node_ids)} "
+        f"in {time.time() - t0:.2f}s"
+    )
+    return m
+
+
+def _save_disk_cache(m: "SuperPointLoadedMap") -> None:
+    """Dump SuperPointLoadedMap to safetensors + sidecar JSON. Atomic via
+    tmp + rename so concurrent loaders never see a partial file.
+    """
+    import json
+    import os
+    import tempfile
+    import time
+
+    if not m.node_ids:
+        return
+    bundle_path, sidecar_path = _floor_cache_paths(m.map_id)
+
+    t0 = time.time()
+    # Stack per-keyframe tensors with offset metadata.
+    kpts_list, desc_list, world3d_list, image_size_list, offsets = [], [], [], [], [0]
+    for nid in m.node_ids:
+        feats = m.keyframe_feats.get(nid)
+        if feats is None:
+            continue
+        kp = feats["keypoints"][0].detach().cpu()       # (N, 2)
+        de = feats["descriptors"][0].detach().cpu().to(torch.float16)  # (N, 256) fp16
+        sz = feats["image_size"][0].detach().cpu()      # (2,)
+        w3 = m.keyframe_world3d.get(nid)
+        if w3 is None:
+            w3 = np.full((kp.shape[0], 3), float("nan"), dtype=np.float32)
+        kpts_list.append(kp)
+        desc_list.append(de)
+        world3d_list.append(torch.from_numpy(w3.astype(np.float32)))
+        image_size_list.append(sz)
+        offsets.append(offsets[-1] + kp.shape[0])
+
+    tensors = {
+        "keypoints": torch.cat(kpts_list, dim=0),                # (total_N, 2) float32
+        "descriptors": torch.cat(desc_list, dim=0),               # (total_N, 256) fp16
+        "keypoints_world3d": torch.cat(world3d_list, dim=0),      # (total_N, 3) float32
+        "image_sizes": torch.stack(image_size_list, dim=0),       # (K, 2) float32
+    }
+    if m.global_descs is not None:
+        tensors["global_descs"] = m.global_descs.detach().cpu()
+    if m.optical_to_base is not None:
+        tensors["optical_to_base"] = torch.from_numpy(
+            np.asarray(m.optical_to_base, dtype=np.float32)
+        )
+    if m.base_to_optical is not None:
+        tensors["base_to_optical"] = torch.from_numpy(
+            np.asarray(m.base_to_optical, dtype=np.float32)
+        )
+
+    sidecar = {
+        "schema_version": _CACHE_SCHEMA_VERSION,
+        "map_id": m.map_id,
+        "source_db_path": str(m.db_path),
+        "source_db_mtime": (
+            os.path.getmtime(m.db_path) if Path(m.db_path).exists() else None
+        ),
+        "node_ids": list(m.node_ids),
+        "node_offsets": offsets,
+        "node_poses": {
+            str(k): v.tolist() for k, v in m.node_poses.items()
+        },
+    }
+
+    from safetensors.torch import save_file as _save_safetensors
+
+    bundle_tmp = tempfile.NamedTemporaryFile(
+        prefix=f".{m.map_id}.", suffix=".safetensors.tmp",
+        dir=str(bundle_path.parent), delete=False,
+    )
+    bundle_tmp.close()
+    try:
+        _save_safetensors(tensors, bundle_tmp.name)
+        os.replace(bundle_tmp.name, bundle_path)
+    except Exception:
+        Path(bundle_tmp.name).unlink(missing_ok=True)
+        raise
+
+    sidecar_tmp = sidecar_path.with_suffix(".json.tmp")
+    try:
+        sidecar_tmp.write_text(json.dumps(sidecar), encoding="utf-8")
+        os.replace(sidecar_tmp, sidecar_path)
+    except Exception:
+        sidecar_tmp.unlink(missing_ok=True)
+        raise
+
+    sz_mb = bundle_path.stat().st_size / (1 << 20)
+    logger.info(
+        f"[SuperPoint] disk cache saved map='{m.map_id}' frames={len(m.node_ids)} "
+        f"size={sz_mb:.1f}MB in {time.time() - t0:.2f}s"
+    )

@@ -246,6 +246,8 @@ class ScanIngestRepository:
                 "dx_local": bm.dx_local,
                 "dy_local": bm.dy_local,
                 "dz_local": bm.dz_local,
+                # 0011: sidecar sqlite 원본 id (branch_edge from/to 와 매칭용).
+                "local_id": bm.id,
             }
             for bm in contents.branch_marks
         ]

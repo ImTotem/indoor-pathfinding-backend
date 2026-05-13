@@ -38,6 +38,9 @@ dependencies = [
     "torchvision>=0.18.0",
     # Sprint 83: SegFormer-b0 ADE20K floor segmentation
     "transformers>=4.40.0",
+    # Persistent SuperPoint feature cache: zero-copy mmap, immune to torch
+    # version drift, survives uvicorn --reload (see map_manager._floor_cache_*).
+    "safetensors>=0.4.0",
 ]
 
 [project.optional-dependencies]

@@ -14,6 +14,15 @@ class Settings:
     BASE_DIR = Path(__file__).resolve().parent.parent
     DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
     MAPS_DIR = DATA_DIR / "maps"
+    # Persistent SuperPoint feature cache (safetensors + sidecar JSON per floor).
+    # Survives uvicorn --reload so the next localize warm-up reads from mmap'd
+    # disk (~1s) instead of rebuilding from rtabmap.db (~26s per floor).
+    SUPERPOINT_CACHE_DIR = Path(
+        os.getenv(
+            "SUPERPOINT_CACHE_DIR",
+            BASE_DIR.parent / "var" / "cache" / "superpoint",
+        )
+    )
 
     SLAM_ENGINE_TYPE = os.getenv("SLAM_ENGINE", "rtabmap")
     RTABMAP_PATH = os.getenv(

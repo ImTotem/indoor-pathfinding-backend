@@ -56,6 +56,7 @@ class SLAMLocalizeResponse(BaseModel):
     matchedImageIndex: int = Field(0, description="가장 잘 매칭된 요청 이미지 인덱스")
     floorId: str = Field("", description="선택된 층 ID")
     floorLevel: int = Field(0, description="선택된 층 레벨")
+    debug: dict = Field(default_factory=dict, description="엔진별 디버그 메타데이터")
 
 
 class MapMetadata(BaseModel):

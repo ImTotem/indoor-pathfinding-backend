@@ -14,7 +14,7 @@ from indoor_server.application.routing.manhattan_path import (
     manhattanize_route_polyline,
     polyline_length,
 )
-from indoor_server.application.routing.snap import snap_coordinate_to_node
+from indoor_server.application.routing.snap import snap_coordinate_to_graph
 from indoor_server.domain.routing.errors import (
     EndpointNodeNotFoundError,
     PathNotFoundError,
@@ -164,8 +164,9 @@ class RouteService:
         Returns snap_distance_m=None when node_id/poi_mark_id 직접 지정.
         """
         if endpoint.coordinate is not None:
-            nid, dist = snap_coordinate_to_node(
+            nid, dist = snap_coordinate_to_graph(
                 endpoint.coordinate,
+                g,
                 node_lookup,
                 self._snap_threshold_m,
                 side=side,

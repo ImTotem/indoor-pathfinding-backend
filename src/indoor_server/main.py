@@ -300,6 +300,13 @@ async def domain_error_handler(request: Request, exc: ScanDomainError) -> JSONRe
 @app.exception_handler(HTTPException)
 async def v1_http_exception_handler(request: Request, exc: HTTPException) -> Response:
     if request.url.path.startswith("/api/v1/") and _is_v1_error_detail(exc.detail):
+        # Surface 4xx detail (DESTINATION_NOT_FOUND etc.) so production logs show
+        # exactly what failed without needing the client's response body.
+        if 400 <= exc.status_code < 500:
+            logger.warning(
+                "v1 %d path=%s method=%s detail=%s",
+                exc.status_code, request.url.path, request.method, exc.detail,
+            )
         return JSONResponse(
             status_code=exc.status_code,
             content=exc.detail,
@@ -313,13 +320,20 @@ async def v1_request_validation_error_handler(
     request: Request,
     exc: RequestValidationError,
 ) -> Response:
+    # Log the missing/invalid fields so 422s in production are debuggable
+    # (pydantic errors don't surface in uvicorn's access log).
+    errors = jsonable_encoder(exc.errors())
+    logger.warning(
+        "validation 422 path=%s method=%s errors=%s",
+        request.url.path, request.method, errors,
+    )
     if request.url.path.startswith("/api/v1/"):
         return JSONResponse(
             status_code=422,
             content={
                 "code": "VALIDATION_ERROR",
                 "message": "request validation failed",
-                "detail": {"errors": jsonable_encoder(exc.errors())},
+                "detail": {"errors": errors},
             },
         )
     return await request_validation_exception_handler(request, exc)

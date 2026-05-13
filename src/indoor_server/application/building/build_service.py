@@ -308,6 +308,33 @@ class BuildService:
             }
         )
 
+        # v9: branch_edge 가 있으면 sprint82 skeleton/junction 결과 무시 + 사용자 명시 backbone 사용.
+        # (사용자 정책: 클라가 직접 찍은 노드/엣지가 graph 의 single source of truth)
+        v2_corridor = await self._load_v2_corridor_backbone(
+            scan_id=scan_id, scan_uuid=scan_uuid, build_job_uuid=job_uuid,
+        )
+        if v2_corridor is not None:
+            v2_nodes, v2_edges = v2_corridor
+            # v2 path 는 corridor backbone 만 들어옴. POI 는 perpendicular drop 으로
+            # corridor edge 에 attach (interfloor 는 아래 단계에서 동일 방식 처리).
+            v2_nodes, v2_edges = _append_poi_nodes_to_corridor(
+                pois=pois,
+                nodes=v2_nodes,
+                edges=v2_edges,
+                scan_id=scan_uuid,
+                build_job_id=job_uuid,
+            )
+            logger.info(
+                "v9 path: skeleton graph 폐기 → 사용자 명시 backbone scan_id=%s "
+                "nodes=%d edges=%d (corridor + POI attach)",
+                scan_id, len(v2_nodes), len(v2_edges),
+            )
+            outcome = outcome.model_copy(update={
+                "nodes": v2_nodes,
+                "edges": v2_edges,
+                "passed_quality_gate": True,  # v9 path 는 quality_gate 우회
+            })
+
         if outcome.passed_quality_gate and interfloor_marks:
             nodes_with_connectors, edges_with_connectors = _append_interfloor_connector_nodes(
                 interfloor_marks=interfloor_marks,
@@ -521,8 +548,22 @@ class BuildService:
             return {"status": "skipped", "reason": "input_db_missing"}
 
         output_db = input_db.parent / "rtabmap_reprocessed.db"
-        # 이미 처리된 scan 은 skip (idempotent). force-rebuild 시 호출자가 미리 삭제.
+        # 이미 처리된 scan 은 reprocess 자체는 skip 하지만 pose backfill 은 매번 재실행
+        # (idempotent — 같은 OptimizedPose 결과 + drift fallback 등 후속 보정 반영).
         if output_db.exists():
+            from indoor_server.application.building.reprocess_service import extract_optimized_poses
+            try:
+                optimized = await asyncio.to_thread(extract_optimized_poses, output_db)
+                async with AsyncSession(self._engine) as session:
+                    async with session.begin():
+                        await run_full_backfill(
+                            session, scan_id=scan_id, optimized=optimized,
+                        )
+            except Exception as e:
+                logger.warning(
+                    "already-reprocessed pose backfill 실패 scan_id=%s err=%s",
+                    scan_id, e,
+                )
             return {
                 "status": "skipped",
                 "reason": "already_reprocessed",
@@ -1238,6 +1279,7 @@ class BuildService:
                         t.branch_mark.c.node_type,
                         t.branch_mark.c.width_m,
                         t.branch_mark.c.mark_session_id,
+                        t.branch_mark.c.local_id,
                     ).where(t.branch_mark.c.scan_id == scan_id)
                 )
             ).fetchall()
@@ -1256,13 +1298,16 @@ class BuildService:
         if not be_rows:
             return None
 
-        # PG id ASC 순 = sqlite INSERT 순 → local id (1..N) 복원
-        br_sorted = sorted(br_rows, key=lambda r: r.id)
-        local_id_by_pg = {r.id: i + 1 for i, r in enumerate(br_sorted)}
-        br_by_local = {local_id_by_pg[r.id]: r for r in br_sorted}
+        # 0011: branch_mark.local_id = sidecar sqlite 원본 id (sparse 가능). branch_edge.from/to
+        # 가 이 값을 참조한다. local_id 가 NULL 인 옛 데이터는 PG id ASC fallback 매핑.
+        if any(r.local_id is None for r in br_rows):
+            br_sorted = sorted(br_rows, key=lambda r: r.id)
+            br_by_local: dict[int, object] = {i + 1: r for i, r in enumerate(br_sorted)}
+        else:
+            br_by_local = {int(r.local_id): r for r in br_rows}
 
         # 1. corridor backbone 노드 (width_m IS NOT NULL 만)
-        # ARKit (tx, ty, tz) → graph (x=tx, y=-tz, z=ty)
+        # 클라 좌표는 이미 (x, y, z=height) world frame. interfloor / POI 와 동일하게 raw 사용.
         # corner 는 polygon 만 사용 (graph 추가 X)
         node_uuid_by_local: dict[int, UUID] = {}
         map_nodes: list[MapNodeVO] = []
@@ -1277,8 +1322,8 @@ class BuildService:
                 build_job_id=build_job_uuid,
                 node_type=NodeType.CORRIDOR,
                 x=float(r.tx),
-                y=float(-r.tz),
-                z=float(r.ty),
+                y=float(r.ty),
+                z=float(r.tz),
                 label=None,
                 source_ref={
                     "role": "v9_explicit_corridor",
@@ -1379,7 +1424,7 @@ class BuildService:
                 node_id=str(local_id_by_pg[r.id]),  # sqlite local id (1..N)
                 kind=str(r.node_type),
                 x=float(r.tx),
-                y=float(-r.tz),  # ARKit y-up → polygon 2D 평면 (z forward 를 y 축으로)
+                y=float(r.ty),
                 width_m=float(r.width_m) if r.width_m is not None else None,
                 mark_session_id=str(r.mark_session_id) if r.mark_session_id else None,
             )
@@ -1485,6 +1530,56 @@ class BuildService:
 # ── Sprint 84 interfloor connector helpers ───────────────────────────────────
 
 
+def _append_poi_nodes_to_corridor(
+    *,
+    pois: list[POIMarkRow],
+    nodes: list[MapNodeVO],
+    edges: list[MapEdgeVO],
+    scan_id: UUID,
+    build_job_id: UUID,
+) -> tuple[list[MapNodeVO], list[MapEdgeVO]]:
+    """v9 corridor backbone 에 POI 노드를 perpendicular drop attach.
+
+    클라 좌표는 이미 (x, y, z=height) world frame — interfloor / corridor 와 동일.
+    """
+    if not pois:
+        return nodes, edges
+
+    out_nodes = list(nodes)
+    out_edges = list(edges)
+    for poi in pois:
+        wx = float(poi.tx)
+        wy = float(poi.ty)
+        wz = float(poi.tz)
+        label = poi.label if poi.label else f"POI {poi.id}"
+        poi_node = MapNodeVO(
+            node_id=uuid5(build_job_id, f"v2-poi:{poi.id}"),
+            scan_id=scan_id,
+            build_job_id=build_job_id,
+            node_type=NodeType.POI,
+            x=wx,
+            y=wy,
+            z=wz,
+            label=label,
+            poi_mark_id=poi.id,
+            source_ref={
+                "role": "v9_poi",
+                "poi_mark_id": poi.id,
+                "source": str(poi.source),
+                "keyframe_seq": poi.keyframe_seq,
+            },
+        )
+        out_nodes.append(poi_node)
+        out_nodes, out_edges = _attach_via_perpendicular_drop(
+            target=poi_node,
+            map_nodes=out_nodes,
+            map_edges=out_edges,
+            scan_uuid=scan_id,
+            job_uuid=build_job_id,
+        )
+    return out_nodes, out_edges
+
+
 def _append_interfloor_connector_nodes(
     *,
     interfloor_marks: list[InterfloorMarkDbRow],
@@ -1520,11 +1615,16 @@ def _append_interfloor_connector_nodes(
         else:
             wx, wy, wz = raw_xyz
             position_source = "raw_arkit_fallback"
+        passage_type = {
+            "stairs": NodeType.PASSAGE_STAIRS,
+            "elevator": NodeType.PASSAGE_ELEVATOR,
+            "escalator": NodeType.PASSAGE_ESCALATOR,
+        }.get(connector_type, NodeType.POI)
         connector_node = MapNodeVO(
             node_id=uuid5(build_job_id, f"interfloor-connector:{mark.id}"),
             scan_id=scan_id,
             build_job_id=build_job_id,
-            node_type=NodeType.POI,
+            node_type=passage_type,
             x=float(wx),
             y=float(wy),
             z=float(wz),

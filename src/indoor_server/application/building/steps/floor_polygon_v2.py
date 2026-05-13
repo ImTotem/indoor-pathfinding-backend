@@ -28,8 +28,8 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import networkx as nx
-from shapely.geometry import LineString, Polygon, MultiPolygon, mapping
-from shapely.ops import unary_union
+from shapely.geometry import LineString, Polygon, MultiPolygon, mapping, shape
+from shapely.ops import linemerge, unary_union
 from shapely.geometry.base import BaseGeometry
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,20 @@ def _extract_corner_cycle(
 
 def _geojson_geometry(geom: BaseGeometry) -> dict:
     return mapping(geom)
+
+
+def _iter_line_geometries(geom: BaseGeometry) -> list[LineString]:
+    """Return only non-empty LineString parts from a shapely geometry."""
+    if geom.is_empty:
+        return []
+    if isinstance(geom, LineString):
+        return [geom] if geom.length >= 1e-6 else []
+    if hasattr(geom, "geoms"):
+        lines: list[LineString] = []
+        for part in geom.geoms:
+            lines.extend(_iter_line_geometries(part))
+        return lines
+    return []
 
 
 def build_floor_polygon(
@@ -184,6 +198,8 @@ def build_floor_polygon(
             cg.add_edge(e.from_node_id, e.to_node_id)
     components = list(nx.connected_components(cg))
 
+    component_corridor_polys: list[BaseGeometry] = []
+
     for comp_idx, comp_node_ids in enumerate(components):
         comp_nodes = [node_by_id[nid] for nid in comp_node_ids]
         comp_width = _assign_component_width(comp_nodes)
@@ -191,6 +207,7 @@ def build_floor_polygon(
             e for e in corridor_edges
             if e.from_node_id in comp_node_ids and e.to_node_id in comp_node_ids
         ]
+        component_line_parts: list[LineString] = []
         for e in comp_edges:
             a = node_by_id[e.from_node_id]
             b = node_by_id[e.to_node_id]
@@ -205,14 +222,11 @@ def build_floor_polygon(
                     if outside_part.is_empty:
                         continue
             # outside_part 가 LineString or MultiLineString
-            segs = (
-                list(outside_part.geoms)
-                if hasattr(outside_part, "geoms")
-                else [outside_part]
-            )
+            segs = _iter_line_geometries(outside_part)
             for seg in segs:
                 if seg.is_empty or seg.length < 1e-6:
                     continue
+                component_line_parts.append(seg)
                 buffered = seg.buffer(
                     comp_width / 2,
                     cap_style="flat",
@@ -231,26 +245,38 @@ def build_floor_polygon(
                         "component_id": comp_idx,
                     },
                 })
+        if component_line_parts:
+            try:
+                centerline = linemerge(unary_union(component_line_parts))
+            except Exception:
+                centerline = unary_union(component_line_parts)
+            buffered_component = centerline.buffer(
+                comp_width / 2,
+                cap_style="flat",
+                join_style="mitre",
+                mitre_limit=2.0,
+            )
+            if not buffered_component.is_valid:
+                buffered_component = buffered_component.buffer(0)
+            if not buffered_component.is_empty:
+                component_corridor_polys.append(buffered_component)
 
     # 3. Final floor_union (전체 polygon 합집합)
     individual_geoms = [
         # rooms
         *room_polys,
-        # corridors (buffered geometries)
-        *[
-            f["geometry"]
-            for f in features
-            if f["properties"].get("kind") == "corridor"
-        ],
+        # corridor connected components buffered as whole centerlines.
+        # Buffering each edge independently leaves gaps/steps at L-shaped
+        # junctions; component-level buffering lets GEOS handle joins once.
+        *component_corridor_polys,
     ]
     # geometry dict 일 수도 — shapely.shape 로 다시 변환
-    from shapely.geometry import shape as _shape
     union_inputs: list[BaseGeometry] = []
     for g in individual_geoms:
         if isinstance(g, BaseGeometry):
             union_inputs.append(g)
         else:
-            union_inputs.append(_shape(g))
+            union_inputs.append(shape(g))
     if union_inputs:
         floor_union = unary_union(union_inputs)
         features.append({

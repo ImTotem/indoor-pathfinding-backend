@@ -17,7 +17,9 @@ build_state_enum = sa.Enum(
     name="build_state",
 )
 node_type_enum = sa.Enum(
-    "junction", "endpoint", "corridor", "poi", "poi_attach", name="node_type"
+    "junction", "endpoint", "corridor", "poi", "poi_attach",
+    "passage_stairs", "passage_elevator", "passage_escalator",
+    name="node_type",
 )
 edge_type_enum = sa.Enum("skeleton", "poi_spur", name="edge_type")
 build_step_enum = sa.Enum(
@@ -502,6 +504,8 @@ branch_mark = sa.Table(
     sa.Column("dx_local", sa.Float, nullable=True),
     sa.Column("dy_local", sa.Float, nullable=True),
     sa.Column("dz_local", sa.Float, nullable=True),
+    # 0011: sidecar sqlite 원본 id (branch_edge.from_node_id/to_node_id 와 매칭용).
+    sa.Column("local_id", sa.Integer, nullable=True),
     sa.ForeignKeyConstraint(
         ["scan_id", "keyframe_seq"],
         ["keyframe_meta.scan_id", "keyframe_meta.seq"],

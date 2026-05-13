@@ -32,6 +32,9 @@ class NodeType(StrEnum):
     CORRIDOR = "corridor"       # degree = 2, 등간격 샘플
     POI = "poi"                 # 의미 객체
     POI_ATTACH = "poi_attach"   # POI <-> skeleton 연결 virtual 노드
+    PASSAGE_STAIRS = "passage_stairs"
+    PASSAGE_ELEVATOR = "passage_elevator"
+    PASSAGE_ESCALATOR = "passage_escalator"
 
 
 class EdgeType(StrEnum):
