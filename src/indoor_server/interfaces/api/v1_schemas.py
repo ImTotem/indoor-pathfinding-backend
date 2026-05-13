@@ -102,16 +102,33 @@ class ScanChunkResponse(V1Model):
     active: bool
     upload_order: int = Field(alias="uploadOrder")
     created_at: datetime | None = Field(None, alias="createdAt")
+    included_in_merged_scan: UUID | None = Field(
+        None,
+        alias="includedInMergedScan",
+        description=(
+            "If this source scan is part of the floor's currently active "
+            "merged scan, the merged scan_id. NULL otherwise."
+        ),
+    )
 
 
 class MergeScansRequest(V1Model):
-    chunk_ids: list[UUID] = Field(default_factory=list, alias="chunkIds")
+    chunk_ids: list[UUID] = Field(
+        default_factory=list,
+        alias="chunkIds",
+        description=(
+            "Specific floor_scan UUIDs (or scan UUIDs) to include. Empty list = "
+            "merge every READY/UPLOADED scan currently on the floor."
+        ),
+    )
 
 
 class MergedScanResponse(V1Model):
     floor_id: UUID = Field(alias="floorId")
     active_scan_id: UUID | None = Field(None, alias="activeScanId")
-    status: str
+    status: str = Field(
+        description="READY / PROCESSING / COMPLETED / FAILED / NOT_STARTED"
+    )
 
 
 class ProcessingStatusResponse(V1Model):
@@ -123,28 +140,149 @@ class ProcessingStatusResponse(V1Model):
     error: str | None = None
 
 
+# ── Streaming scan ingest (start → frames → finalize → build) ────────────────
+
+
+class ScanStartRequest(V1Model):
+    """Optional scan_id (client-generated UUID) + device info JSON string."""
+
+    scan_id: str | None = Field(
+        None,
+        alias="scanId",
+        description="UUID for this scan. Server generates one if omitted.",
+    )
+    device_info: str | None = Field(
+        None,
+        alias="deviceInfo",
+        description="Optional JSON string with device metadata "
+        "({model, app_version, ...}).",
+    )
+
+
+class ScanStartResponse(V1Model):
+    scan_id: UUID = Field(alias="scanId")
+    floor_id: UUID = Field(alias="floorId")
+    storage_path: str = Field(alias="storagePath")
+    state: Literal["OPEN"] = "OPEN"
+
+
+class FrameLinkPayload(V1Model):
+    """Edge between two Nodes within the same scan.
+
+    `transform` is the 48-byte (3x4 float32 row-major) relative pose blob.
+    `informationMatrix` is the 288-byte 6x6 float64 covariance blob.
+    Both are base64-encoded in JSON.
+    """
+
+    from_id: int = Field(alias="fromId")
+    to_id: int = Field(alias="toId")
+    type: int = Field(
+        0,
+        description="RTAB-Map link type. 0=NEIGHBOR, 1=LOOP_CLOSURE, etc.",
+    )
+    transform_b64: str = Field(
+        alias="transform",
+        description="base64 of 48-byte 3x4 float32 row-major transform.",
+    )
+    information_matrix_b64: str | None = Field(
+        None,
+        alias="informationMatrix",
+        description="base64 of 288-byte 6x6 float64. Identity if omitted.",
+    )
+    user_data_b64: str | None = Field(None, alias="userData")
+
+
+class FramePayload(V1Model):
+    """One RTAB-Map Node + Data tuple to append.
+
+    Blobs are base64-encoded in JSON. iOS clients should send the exact
+    rtabmap-formatted blobs they would have written to the local rtabmap.db:
+    image as JPEG, depth as RVL, pose as 48-byte 3x4 float32, calibration as
+    164-byte intrinsics+local_transform blob.
+    """
+
+    node_id: int = Field(alias="nodeId", ge=1)
+    map_id: int = Field(0, alias="mapId")
+    weight: int = Field(0, alias="weight")
+    stamp: float = Field(
+        description="Capture timestamp (seconds since RTAB-Map epoch).",
+    )
+    pose_b64: str = Field(
+        alias="pose",
+        description="base64 of 48-byte 3x4 float32 row-major pose.",
+    )
+    image_b64: str = Field(
+        alias="image",
+        description="base64 of JPEG-encoded RGB keyframe.",
+    )
+    calibration_b64: str = Field(
+        alias="calibration",
+        description="base64 of 164-byte calibration blob.",
+    )
+    depth_b64: str | None = Field(
+        None,
+        alias="depth",
+        description="base64 of RVL-compressed depth map (optional).",
+    )
+    depth_confidence_b64: str | None = Field(
+        None, alias="depthConfidence",
+    )
+    ground_truth_pose_b64: str | None = Field(
+        None, alias="groundTruthPose",
+    )
+    velocity_b64: str | None = Field(None, alias="velocity")
+    gps_b64: str | None = Field(None, alias="gps")
+    env_sensors_b64: str | None = Field(None, alias="envSensors")
+    label: str | None = None
+    user_data_b64: str | None = Field(None, alias="userData")
+    scan_b64: str | None = Field(None, alias="scan")
+    scan_info_b64: str | None = Field(None, alias="scanInfo")
+
+
+class ScanFramesRequest(V1Model):
+    """Batch of frames + links to append.
+
+    K is unbounded — server consumes whatever the client sends. Frames whose
+    `nodeId` has already been ingested are skipped (idempotent retry).
+    """
+
+    frames: list[FramePayload] = Field(default_factory=list)
+    links: list[FrameLinkPayload] = Field(default_factory=list)
+
+
+class ScanFramesResponse(V1Model):
+    scan_id: UUID = Field(alias="scanId")
+    frames_applied: int = Field(alias="framesApplied")
+    frames_skipped: int = Field(alias="framesSkipped")
+    links_applied: int = Field(alias="linksApplied")
+    links_skipped: int = Field(alias="linksSkipped")
+    last_node_id: int = Field(alias="lastNodeId")
+    node_count: int = Field(alias="nodeCount")
+
+
+class ScanFinalizeResponse(V1Model):
+    scan_id: UUID = Field(alias="scanId")
+    floor_id: UUID = Field(alias="floorId")
+    state: Literal["READY"] = "READY"
+    node_count: int = Field(alias="nodeCount")
+    keyframe_count: int = Field(alias="keyframeCount")
+    poi_mark_count: int = Field(alias="poiMarkCount")
+    payload_sha256: str = Field(alias="payloadSha256")
+
+
 class PathfindingRequest(V1Model):
     """길찾기 요청. 사용자의 현재 위치(world meter) + 도착 POI 이름.
 
-    시작 floor 결정 규칙: `startScanId` 우선 → 없으면 `startFloorLevel`.
-    둘 다 없으면 422 `START_NOT_SPECIFIED`.
+    시작 floor 는 좌표 z 기반으로 서버가 자동 결정한다. 명시 override 가 필요할
+    때만 `startFloorLevel` 을 보낸다.
     """
 
-    start_scan_id: UUID | None = Field(
-        None,
-        alias="startScanId",
-        description=(
-            "현재 측위된 scan UUID. `/buildings/{id}/localize` 응답의 `mapId` 또는 "
-            "`scans[].scanId` 를 그대로 넣으면 시작 floor 가 자동 결정된다. "
-            "이 필드를 보내면 `startFloorLevel` 은 무시된다."
-        ),
-    )
     start_floor_level: int | None = Field(
         None,
         alias="startFloorLevel",
         description=(
-            "Legacy fallback: 시작 floor 의 층수. `startScanId` 가 있으면 무시. "
-            "신규 클라는 `startScanId` 사용 권장."
+            "Optional override: 시작 floor 의 층수를 강제로 지정. 보통 보낼 필요 없다. "
+            "생략하면 `startZ` 좌표로 서버가 가장 가까운 floor 의 active scan 을 자동 선택."
         ),
     )
     start_x: float = Field(
@@ -298,7 +436,8 @@ class FloorMapNode(V1Model):
             "`junction` (route-only 분기 노드, width 없음), "
             "`poi` (POI 자체 노드, 라벨 표시), "
             "`poi_attach` (POI/connector 가 corridor 에 붙는 foot, 화면에서 보통 hidden), "
-            "`passage` (interfloor 연결 노드 — connector 필드 채움). "
+            "`passage_stairs` / `passage_elevator` / `passage_escalator` "
+            "(interfloor 연결 노드, connector 필드도 함께 채움). "
             "`endpoint` 는 legacy."
         )
     )
@@ -341,7 +480,7 @@ class FloorMapResponse(V1Model):
     building_id: UUID = Field(alias="buildingId", description="속한 building UUID.")
     scan_id: UUID = Field(
         alias="scanId",
-        description="이 floor 의 active scan UUID. 길찾기 요청의 startScanId 로 사용 가능.",
+        description="이 floor 의 active scan UUID. 디버깅/캐시 키 용도.",
     )
     floor_level: int = Field(alias="floorLevel", description="층수 (지하면 음수).")
     floor_name: str | None = Field(

@@ -119,7 +119,9 @@ async def backfill_dependent_poses(
     Returns:
         (poi_updated, branch_updated, interfloor_updated)
     """
-    # keyframe_seq → (pose_matrix, tx, ty, tz)
+    # keyframe_seq → (pose_matrix, tx, ty, tz). reprocessed (rtabmap_node_id NOT NULL) 만.
+    # ARKit drift 로 일부 keyframe 의 raw pose 가 jump 되어 있을 수 있어, RTABMap 가
+    # keyframe 으로 채택해 graph optimization 통과한 것만 trusted source 로.
     rows = (
         await session.execute(
             sa.select(
@@ -128,7 +130,9 @@ async def backfill_dependent_poses(
                 t.keyframe_meta.c.tx,
                 t.keyframe_meta.c.ty,
                 t.keyframe_meta.c.tz,
-            ).where(t.keyframe_meta.c.scan_id == scan_id)
+            )
+            .where(t.keyframe_meta.c.scan_id == scan_id)
+            .where(t.keyframe_meta.c.rtabmap_node_id.isnot(None))
         )
     ).fetchall()
     by_seq = {row.seq: (row.pose_matrix, row.tx, row.ty, row.tz) for row in rows}
@@ -154,6 +158,23 @@ async def backfill_dependent_poses(
     return (poi_updated, branch_updated, interfloor_updated)
 
 
+# iOS RTABMap library applies this rotation to convert ARKit-world poses
+# into the RTABMap base frame stored in raw rtabmap.db Node.pose:
+#   ARKit (X, Y, Z) → RTABMap base (-Z, -X, Y)
+# Empirically derived from comparing sidecar.keyframe_meta.pose_matrix (ARKit)
+# with raw rtabmap.db Node.pose (RTABMap base) for the same keyframe.
+#
+# iOS sends `dx/dy/dz_local = inverse(T_kf_arkit) @ p_mark_arkit_world`,
+# i.e. coordinates in the ARKit camera frame. The optimized keyframe.pose
+# we store in keyframe_meta is in the RTABMap base frame, so we rotate the
+# ARKit-frame offset into the base frame before applying the keyframe pose.
+_IOS_ARKIT_TO_RTABMAP_BASE_ROT = (
+    (0.0, 0.0, -1.0),
+    (-1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+)
+
+
 async def _backfill_table(
     session: AsyncSession,
     *,
@@ -161,12 +182,14 @@ async def _backfill_table(
     table: sa.Table,
     by_seq: dict[int, tuple[bytes, float, float, float]],
 ) -> int:
-    """mark.pose 를 keyframe pose × local offset 으로 갱신.
+    """mark world pose 를 optimized keyframe pose × axis-swapped local offset 으로 갱신.
 
-    keyframe_meta.pose 는 base→world (4x4 col-major bytes, 64B).
-    table 에 dx_local/dy_local/dz_local 컬럼 있으면 base frame offset 을 적용해서
-    정확한 world position 계산. 없으면 (또는 NULL) 카메라 pose 를 그대로.
+    keyframe_meta.pose 는 base→world (4x4 col-major bytes, 64B), RTABMap base
+    frame 의 표현. 그러나 iOS 가 보낸 dx/dy/dz_local 은 ARKit camera frame 좌표
+    (`inverse(T_kf_arkit) @ p_mark_arkit_world`) 라서, 두 frame 사이의 회전을
+    적용한 뒤 keyframe.R @ local + keyframe.t 로 world 좌표 계산.
     """
+    import bisect
     import numpy as np
     if not by_seq:
         return 0
@@ -178,11 +201,29 @@ async def _backfill_table(
         sa.select(*select_cols).where(table.c.scan_id == scan_id)
     )).fetchall()
 
+    sorted_seqs = sorted(by_seq.keys())
+    swap = np.array(_IOS_ARKIT_TO_RTABMAP_BASE_ROT, dtype=np.float64)
+
+    def _nearest_seq(target: int) -> int | None:
+        if not sorted_seqs:
+            return None
+        idx = bisect.bisect_left(sorted_seqs, target)
+        candidates = []
+        if idx < len(sorted_seqs):
+            candidates.append(sorted_seqs[idx])
+        if idx > 0:
+            candidates.append(sorted_seqs[idx - 1])
+        return min(candidates, key=lambda s: abs(s - target))
+
     updated = 0
     for row in rows:
         kf = by_seq.get(row.keyframe_seq)
         if kf is None:
-            continue
+            # ARKit drift 로 reprocess 안 된 keyframe 에 마크된 케이스 — nearest reprocessed seq fallback.
+            nearest = _nearest_seq(row.keyframe_seq)
+            if nearest is None:
+                continue
+            kf = by_seq[nearest]
         pose_matrix, kf_tx, kf_ty, kf_tz = kf
 
         dx = getattr(row, "dx_local", None) if has_local else None
@@ -190,11 +231,14 @@ async def _backfill_table(
         dz = getattr(row, "dz_local", None) if has_local else None
 
         if dx is not None and dy is not None and dz is not None and pose_matrix:
-            # pose_matrix 는 base→world 4x4 col-major 64B (16 float32).
             T = np.frombuffer(pose_matrix, dtype=np.float32).reshape(4, 4, order="F")
-            local = np.array([dx, dy, dz, 1.0], dtype=np.float64)
-            world = (T.astype(np.float64) @ local)
-            tx, ty, tz = float(world[0]), float(world[1]), float(world[2])
+            local_arkit = np.array([dx, dy, dz], dtype=np.float64)
+            local_rtab = swap @ local_arkit
+            world_xyz = (
+                T[:3, :3].astype(np.float64) @ local_rtab
+                + T[:3, 3].astype(np.float64)
+            )
+            tx, ty, tz = float(world_xyz[0]), float(world_xyz[1]), float(world_xyz[2])
         else:
             tx, ty, tz = kf_tx, kf_ty, kf_tz
 

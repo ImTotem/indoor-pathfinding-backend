@@ -1,6 +1,7 @@
 """FastAPI 앱 factory."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -61,6 +62,67 @@ OPENAPI_TAGS = [
 ]
 
 
+async def _warmup_active_floor_caches(pool: asyncpg.Pool) -> None:
+    """Preload SuperPoint cache for every floor whose active scan is READY.
+
+    Runs once at server startup. Each floor's indexing dispatched to a worker
+    thread (sync) so the lifespan startup doesn't block. After uvicorn reload
+    this restores the cache that the in-memory `SuperPointMapManager`
+    singleton lost on the process restart.
+    """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT fs.floor_id::text AS floor_id,
+                       fs.scan_id::text  AS scan_id,
+                       si.storage_path   AS storage_path
+                FROM floor_scan fs
+                JOIN scan_ingest si ON si.scan_id = fs.scan_id
+                WHERE fs.active = true AND fs.status = 'READY'
+                """
+            )
+    except Exception as exc:
+        logger.warning("warmup: query active floors failed: %s", exc)
+        return
+    if not rows:
+        logger.info("warmup: no active READY scans to warm up")
+        return
+
+    storage_root = Path(os.getenv("STORAGE_ROOT", "/app/var/storage"))
+    loop = asyncio.get_event_loop()
+    for r in rows:
+        floor_id = r["floor_id"]
+        storage_path = r["storage_path"]
+        reproc = storage_root / storage_path / "rtabmap_reprocessed.db"
+        raw = storage_root / storage_path / "rtabmap.db"
+        if reproc.exists() and reproc.stat().st_size > 0:
+            db_path = reproc
+        elif raw.exists():
+            db_path = raw
+        else:
+            logger.warning(
+                "warmup: no rtabmap db for floor=%s storage=%s",
+                floor_id, storage_path,
+            )
+            continue
+        logger.info(
+            "warmup: queueing floor=%s db=%s", floor_id, db_path.name,
+        )
+        loop.run_in_executor(None, _do_floor_warmup, floor_id, str(db_path))
+
+
+def _do_floor_warmup(map_id: str, db_path: str) -> None:
+    try:
+        from be.slam_engines.superpoint.map_manager import SuperPointMapManager
+        SuperPointMapManager().get_or_load(map_id, db_path)
+        logger.info("[startup warmup] cache ready map_id=%s", map_id)
+    except Exception as exc:
+        logger.warning(
+            "[startup warmup] failed map_id=%s err=%s", map_id, exc,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize `/api/slam/*` dependencies (메인 사용자 앱 endpoint v3)."""
@@ -106,6 +168,15 @@ async def lifespan(app: FastAPI):
             slam_routes.job_queue = None
     except Exception as exc:
         logger.warning("SLAM router initialized without dependencies: %s", exc)
+
+    # Kick off SuperPoint cache warmup for every active READY floor scan so
+    # the first /localize after a server restart doesn't pay the cold-start
+    # cost. fire-and-forget — actual indexing runs in worker threads.
+    if slam_pool is not None:
+        try:
+            asyncio.create_task(_warmup_active_floor_caches(slam_pool))
+        except Exception as exc:
+            logger.warning("warmup task schedule failed: %s", exc)
 
     yield
 

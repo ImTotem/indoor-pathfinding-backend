@@ -30,6 +30,23 @@ SCAN_STATUS_COMPLETED = "COMPLETED"
 SCAN_STATUS_FAILED = "FAILED"
 
 
+def _preferred_rtabmap_db(storage_root: Path, storage_path: str) -> str:
+    """Return the path the SLAM backend should load for localize.
+
+    Prefer `rtabmap_reprocessed.db` when present — that's the post-build
+    graph-optimized output (loop-closure-corrected Node.pose). Falls back to
+    the raw `rtabmap.db` (ARKit pose) when the scan hasn't been built yet.
+
+    Both files share the same RTAB-Map sqlite schema, so SuperPoint's
+    map_manager can consume either.
+    """
+    reproc = storage_root / storage_path / "rtabmap_reprocessed.db"
+    raw = storage_root / storage_path / "rtabmap.db"
+    if reproc.exists() and reproc.stat().st_size > 0:
+        return str(reproc)
+    return str(raw)
+
+
 class PostgresAdapter:
     """
     Async database adapter using existing scan_sessions table.
@@ -186,7 +203,7 @@ class PostgresAdapter:
                 )
                 if not row:
                     return None
-                return str(self.storage_root / row["storage_path"] / "rtabmap.db")
+                return _preferred_rtabmap_db(self.storage_root, row["storage_path"])
 
         async def _fetch_legacy():
             async with self.pool.acquire() as conn:
@@ -244,7 +261,7 @@ class PostgresAdapter:
                             "id": str(row["id"]),
                             "building_id": str(row["building_id"]),
                             "file_name": row["file_name"] or "rtabmap.db",
-                            "file_path": str(self.storage_root / storage_path / "rtabmap.db"),
+                            "file_path": _preferred_rtabmap_db(self.storage_root, storage_path),
                             "file_size": row["file_size"],
                             "status": status_value,
                             "error_message": None,
@@ -393,7 +410,7 @@ class PostgresAdapter:
                         "floor_id": str(r["floor_id"]),
                         "floor_name": r["floor_name"],
                         "level": r["level"],
-                        "file_path": str(self.storage_root / r["storage_path"] / "rtabmap.db"),
+                        "file_path": _preferred_rtabmap_db(self.storage_root, r["storage_path"]),
                         "scan_id": str(r["scan_id"]),
                     }
                     for r in rows

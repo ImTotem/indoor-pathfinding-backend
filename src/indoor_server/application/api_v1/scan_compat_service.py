@@ -1,7 +1,12 @@
-"""V1 scan chunk/merge/process compatibility wrapper.
+"""V1 scan chunk/process compatibility wrapper.
 
-The old V1 names are retained, but the implementation accepts only the new zip
-scan archive and routes it through `ScanIngestService` with auto enqueue.
+Backs the legacy `/floors/{id}/scans/chunks` (zip ingest), the multi-scan
+merge endpoints, and the build/process endpoints.
+
+The streaming endpoints (`/floors/{id}/scans/start` →
+`/scans/{id}/frames` → `/scans/{id}/finalize`) produce READY scans. The
+zip chunk endpoint produces UPLOADED scans. `merge` accepts either as a
+source and produces a new merged scan (status=READY, active=true).
 """
 from __future__ import annotations
 
@@ -9,6 +14,7 @@ import asyncio
 import hashlib
 import logging
 import shutil
+import sqlite3
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -40,6 +46,12 @@ from indoor_server.interfaces.api.v1_schemas import (
     ProcessingStatusResponse,
     ScanChunkResponse,
 )
+
+
+# Source scans accepted as merge inputs. OPEN scans are still receiving
+# frames; MERGED scans are themselves merge results and shouldn't be
+# re-merged transitively (use the underlying sources instead).
+_MERGE_SOURCE_STATUSES = ("READY", "UPLOADED")
 
 logger = logging.getLogger(__name__)
 
@@ -101,15 +113,65 @@ class ScanCompatService:
         return _chunk_response(row)
 
     async def list_chunks(self, floor_id: UUID) -> list[ScanChunkResponse]:
+        """List source scans only — merge results (status='MERGED') are
+        internal artifacts that drive the build/graph but are never shown to
+        the user. Each source row carries `includedInMergedScan` if it was
+        a source of the floor's currently active merged scan.
+        """
         await BuildingFloorService(self._session).get_floor(floor_id)
+        # Source scans on this floor (everything except merge-result rows).
         rows = (
             await self._session.execute(
                 sa.select(t.floor_scan)
-                .where(t.floor_scan.c.floor_id == str(floor_id))
-                .order_by(t.floor_scan.c.upload_order.asc(), t.floor_scan.c.created_at.asc())
+                .where(
+                    t.floor_scan.c.floor_id == str(floor_id),
+                    t.floor_scan.c.status != "MERGED",
+                )
+                .order_by(
+                    t.floor_scan.c.upload_order.asc(),
+                    t.floor_scan.c.created_at.asc(),
+                )
             )
         ).fetchall()
-        return [_chunk_response(row) for row in rows]
+
+        # Find the floor's currently active merged scan (if any) and the set of
+        # source scan_ids it was built from. Stored in scan_ingest.device_info
+        # (`{"merged_from": [...]}`) so no schema change required.
+        merged_active_id: str | None = None
+        included_ids: set[str] = set()
+        active_merged = (
+            await self._session.execute(
+                sa.select(t.floor_scan.c.scan_id, t.scan_ingest.c.device_info)
+                .join(
+                    t.scan_ingest,
+                    t.scan_ingest.c.scan_id == t.floor_scan.c.scan_id,
+                )
+                .where(
+                    t.floor_scan.c.floor_id == str(floor_id),
+                    t.floor_scan.c.status == "MERGED",
+                    t.floor_scan.c.active.is_(True),
+                )
+                .order_by(t.floor_scan.c.created_at.desc())
+                .limit(1)
+            )
+        ).first()
+        if active_merged is not None:
+            merged_active_id = str(active_merged.scan_id)
+            di = active_merged.device_info or {}
+            for sid in (di.get("merged_from") or []):
+                included_ids.add(str(sid).lower())
+
+        return [
+            _chunk_response(
+                row,
+                included_in_merged_scan=(
+                    UUID(merged_active_id)
+                    if merged_active_id and str(row.scan_id).lower() in included_ids
+                    else None
+                ),
+            )
+            for row in rows
+        ]
 
     async def delete_chunk(self, floor_id: UUID, chunk_id: UUID) -> None:
         result = await self._session.execute(
@@ -122,12 +184,26 @@ class ScanCompatService:
             raise V1ServiceError(404, "CHUNK_NOT_FOUND", "scan chunk not found")
         await self._session.commit()
 
-    async def merge(self, floor_id: UUID, chunk_ids: list[UUID]) -> MergedScanResponse:
-        sources = await self._collect_merge_sources(floor_id=floor_id, chunk_ids=chunk_ids)
-        if not sources:
-            raise V1ServiceError(404, "CHUNK_NOT_FOUND", "scan chunk not found")
+    async def merge(
+        self, floor_id: UUID, chunk_ids: list[UUID]
+    ) -> MergedScanResponse:
+        """Merge two or more READY/UPLOADED scans on a floor into one active scan.
 
-        # 단일 청크: 기존 active flag flip 만 (실 merge 불필요).
+        - Empty `chunk_ids` → all READY/UPLOADED scans on the floor are merged.
+        - Single source → promote it to active (status=READY, active=true).
+        - Multi source → rtabmap-reprocess multi-scan → new merged scan_id,
+          union-copy per-source keyframe_meta + poi_mark + poi_photo into
+          merged scan_id with rtabmap_node_id remapped via provenance labels.
+        """
+        sources = await self._collect_merge_sources(
+            floor_id=floor_id, chunk_ids=chunk_ids
+        )
+        if not sources:
+            raise V1ServiceError(
+                404,
+                "MERGE_SOURCES_NOT_FOUND",
+                "no READY or UPLOADED scans found for merge",
+            )
         if len(sources) == 1:
             row = sources[0]
             await self._session.execute(
@@ -138,45 +214,77 @@ class ScanCompatService:
             await self._session.execute(
                 sa.update(t.floor_scan)
                 .where(t.floor_scan.c.floor_scan_id == row.floor_scan_id)
-                .values(active=True, status="MERGED")
+                .values(active=True, status="READY")
             )
             await self._session.commit()
+            await _kickoff_floor_warmup(
+                floor_id=str(floor_id), scan_id=str(row.scan_id),
+            )
             return MergedScanResponse(
                 floor_id=floor_id,
                 active_scan_id=UUID(str(row.scan_id)),
                 status=await self._merge_status_for_scan(str(row.scan_id)),
             )
-
-        # 다중 청크: rtabmap-reprocess 로 실 RTABMap multi-scan 통합.
         return await self._real_multiscan_merge(floor_id=floor_id, sources=sources)
+
+    async def merge_status(self, floor_id: UUID) -> MergedScanResponse:
+        active = await BuildingFloorService(
+            self._session
+        ).get_active_scan_for_floor(floor_id)
+        return MergedScanResponse(
+            floor_id=floor_id,
+            active_scan_id=UUID(active.scan_id) if active is not None else None,
+            status=await self._merge_status_for_scan(active.scan_id)
+            if active else "NOT_STARTED",
+        )
 
     async def _collect_merge_sources(
         self, *, floor_id: UUID, chunk_ids: list[UUID]
     ) -> list[Any]:
-        filters = [t.floor_scan.c.floor_id == str(floor_id)]
+        filters: list[Any] = [t.floor_scan.c.floor_id == str(floor_id)]
         if chunk_ids:
-            chunk_id_strs = [str(c) for c in chunk_ids]
+            ids = [str(c) for c in chunk_ids]
             filters.append(
                 sa.or_(
-                    t.floor_scan.c.floor_scan_id.in_(chunk_id_strs),
-                    t.floor_scan.c.scan_id.in_(chunk_id_strs),
+                    t.floor_scan.c.floor_scan_id.in_(ids),
+                    t.floor_scan.c.scan_id.in_(ids),
                 )
             )
+        else:
+            filters.append(t.floor_scan.c.status.in_(_MERGE_SOURCE_STATUSES))
         stmt = (
             sa.select(
                 t.floor_scan.c.floor_scan_id,
                 t.floor_scan.c.scan_id,
                 t.floor_scan.c.upload_order,
                 t.floor_scan.c.created_at,
+                t.floor_scan.c.status,
                 t.scan_ingest.c.storage_path,
             )
             .join(t.scan_ingest, t.scan_ingest.c.scan_id == t.floor_scan.c.scan_id)
             .where(*filters)
             .order_by(
-                t.floor_scan.c.upload_order.asc(), t.floor_scan.c.created_at.asc()
+                t.floor_scan.c.upload_order.asc(),
+                t.floor_scan.c.created_at.asc(),
             )
         )
-        return list((await self._session.execute(stmt)).fetchall())
+        rows = list((await self._session.execute(stmt)).fetchall())
+        # When chunk_ids are explicitly provided, reject anything other than
+        # READY/UPLOADED so the caller doesn't accidentally re-merge a merged
+        # output or an OPEN streaming scan still receiving frames.
+        if chunk_ids:
+            bad = [r for r in rows if r.status not in _MERGE_SOURCE_STATUSES]
+            if bad:
+                raise V1ServiceError(
+                    409,
+                    "MERGE_SOURCE_NOT_READY",
+                    "some sources are not in READY/UPLOADED state",
+                    detail={"offending": [
+                        {"scan_id": str(b.scan_id), "status": str(b.status)}
+                        for b in bad
+                    ]},
+                )
+        return rows
 
     async def _real_multiscan_merge(
         self, *, floor_id: UUID, sources: list[Any]
@@ -197,10 +305,10 @@ class ScanCompatService:
         work_dir = merged_dir / "_merge_work"
         work_dir.mkdir(parents=True, exist_ok=True)
 
-        # Stage 1: 각 source 단독 reprocess.
-        # rtabmap-reprocess `-a` (append) 모드는 첫 .db 를 init 으로 두고 둘째부터만
-        # reprocess → 첫 source 노드에 SIFT feature/depth back-projection 안 됨.
-        # 따라서 각 source 를 단독으로 먼저 돌려 Feature/Word 를 채운 뒤 -a merge 한다.
+        # Stage 1: per-source single reprocess to populate Word/Feature.
+        # Streaming-uploaded rtabmap.db ships with Word=0/Feature=0 — only raw
+        # image+depth+pose+calibration — so this stage is required before
+        # multi-scan -a can match cross-session loop closures.
         single_reprocessed: list[SourceRtabmapScan] = []
         for index, row in enumerate(sources):
             source_db = storage_root / row.storage_path / "rtabmap.db"
@@ -215,9 +323,7 @@ class ScanCompatService:
                 stage1_out.unlink()
             logger.info(
                 "rtabmap single reprocess start (stage1) scan_id=%s input=%s output=%s",
-                row.scan_id,
-                source_db,
-                stage1_out,
+                row.scan_id, source_db, stage1_out,
             )
             try:
                 await _run_rtabmap_reprocess_single(
@@ -236,18 +342,13 @@ class ScanCompatService:
                 SourceRtabmapScan(scan_id=str(row.scan_id), db_path=stage1_out)
             )
 
-        # Stage 2: 단독 reprocess 결과들을 -a 로 multi-scan merge.
-        # rtabmap-reprocess 자체 graph optimizer 가 두 ARKit world origin 차이가
-        # 큰 경우 (loop closure translation vs Node.pose 거리 모순) outlier 로
-        # reject 하므로, stage2 결과의 Node.pose 는 두 좌표계가 union 된 채로
-        # 남는다. stage3 에서 RANSAC SE(3) 으로 직접 정렬한다.
+        # Stage 2: rtabmap-reprocess -a "db1;db2;..." → merged db with
+        # provenance labels preserved on each Node.label.
         stage2_db = work_dir / "stage2_unaligned.db"
         logger.info(
             "rtabmap multi-scan merge start (stage2) floor_id=%s sources=%d "
             "merged_scan_id=%s",
-            floor_id,
-            len(single_reprocessed),
-            merged_scan_id,
+            floor_id, len(single_reprocessed), merged_scan_id,
         )
         try:
             result = await runner.run(
@@ -266,10 +367,9 @@ class ScanCompatService:
                 message=str(e),
             ) from e
 
-        # Stage 3: RANSAC SE(3) align + Node.pose patch.
-        # cross-session loop closure 로 T_AB(B→A) 를 추정하고 chunk B 의 모든
-        # Node.pose 를 chunk A 좌표계로 변환한다. (sprint81/align_and_rebuild_merged
-        # 의 검증된 로직을 재사용 — 정확히 2 source 일 때만 적용.)
+        # Stage 3: 2-source RANSAC SE(3) align (yaw + xy translation only) when
+        # the rtabmap-reprocess internal optimizer leaves the two ARKit world
+        # origins union'd. 3+ sources skip alignment (TODO: generalize).
         merged_db_path.parent.mkdir(parents=True, exist_ok=True)
         if len(single_reprocessed) == 2:
             try:
@@ -284,17 +384,15 @@ class ScanCompatService:
                 logger.info(
                     "rtabmap multi-scan merge stage3 align done floor_id=%s "
                     "merged_scan_id=%s",
-                    floor_id,
-                    merged_scan_id,
+                    floor_id, merged_scan_id,
                 )
             except _AlignFailed as e:
                 logger.warning(
-                    "stage3 align failed (%s) — fall back to unaligned stage2 db",
+                    "stage3 align failed (%s) — falling back to unaligned stage2 db",
                     e,
                 )
                 shutil.move(str(stage2_db), str(merged_db_path))
         else:
-            # 3+ sources: align 미지원, stage2 결과 그대로 사용
             shutil.move(str(stage2_db), str(merged_db_path))
 
         payload_sha256 = await asyncio.get_running_loop().run_in_executor(
@@ -308,20 +406,22 @@ class ScanCompatService:
                 scan_id=str(merged_scan_id),
                 payload_sha256=payload_sha256,
                 storage_path=rel_storage_path,
-                device_info=None,
+                # Provenance: list_chunks reads `merged_from` to mark which
+                # source scans are included in the active merged scan.
+                device_info={"merged_from": [str(r.scan_id) for r in sources]},
             )
         )
 
-        # stage4: build pipeline 의 POI projection step 은 active scan_id 로만
-        # keyframe_meta / poi_mark / poi_canonical 을 lookup 한다. chunk A 의
-        # 메타데이터 row 들을 merged_scan_id 로 복사해 POI 가 살아남게 한다.
-        # (chunk B 는 align T_AB 적용이 필요해 다음 phase 에서 일반화. 현재는
-        # chunk B 에 POI 가 없는 케이스만 정상 처리.)
-        if sources:
-            await self._copy_anchor_metadata_to_merged(
-                anchor_scan_id=str(sources[0].scan_id),
-                merged_scan_id=str(merged_scan_id),
-            )
+        # Stage 4 (migrated): UNION-copy keyframe_meta / poi_mark / poi_photo
+        # from ALL source scans into merged_scan_id, with rtabmap_node_id
+        # remapped via merged db provenance labels and keyframe_seq renumbered
+        # to be globally unique within merged_scan_id.
+        union_counts = await self._union_metadata_into_merged(
+            merged_scan_id=str(merged_scan_id),
+            source_scan_ids=[str(r.scan_id) for r in sources],
+            merged_db_path=merged_db_path,
+        )
+
         await self._session.execute(
             sa.update(t.floor_scan)
             .where(t.floor_scan.c.floor_id == str(floor_id))
@@ -329,8 +429,9 @@ class ScanCompatService:
         )
         max_order = (
             await self._session.execute(
-                sa.select(sa.func.coalesce(sa.func.max(t.floor_scan.c.upload_order), 0))
-                .where(t.floor_scan.c.floor_id == str(floor_id))
+                sa.select(
+                    sa.func.coalesce(sa.func.max(t.floor_scan.c.upload_order), 0)
+                ).where(t.floor_scan.c.floor_id == str(floor_id))
             )
         ).scalar_one()
         await self._session.execute(
@@ -339,20 +440,20 @@ class ScanCompatService:
                 scan_id=str(merged_scan_id),
                 file_name=f"merged_{merged_scan_id}.db",
                 file_size=file_size,
-                status="MERGED",
+                status="READY",
                 active=True,
                 upload_order=int(max_order) + 1,
             )
         )
         await self._session.commit()
+        await _kickoff_floor_warmup(
+            floor_id=str(floor_id), scan_id=str(merged_scan_id),
+        )
         logger.info(
             "rtabmap multi-scan merge complete floor_id=%s merged_scan_id=%s "
-            "duration=%.1fs nodes=%d loop_closures=%d",
-            floor_id,
-            merged_scan_id,
-            result.duration_s,
-            result.merged_node_count,
-            result.loop_closure_count,
+            "duration=%.1fs nodes=%d loop_closures=%d union_counts=%s",
+            floor_id, merged_scan_id, result.duration_s,
+            result.merged_node_count, result.loop_closure_count, union_counts,
         )
         return MergedScanResponse(
             floor_id=floor_id,
@@ -360,13 +461,307 @@ class ScanCompatService:
             status=await self._merge_status_for_scan(str(merged_scan_id)),
         )
 
-    async def merge_status(self, floor_id: UUID) -> MergedScanResponse:
-        active = await BuildingFloorService(self._session).get_active_scan_for_floor(floor_id)
-        return MergedScanResponse(
-            floor_id=floor_id,
-            active_scan_id=UUID(active.scan_id) if active is not None else None,
-            status=await self._merge_status_for_scan(active.scan_id) if active else "NOT_STARTED",
+    async def _union_metadata_into_merged(
+        self,
+        *,
+        merged_scan_id: str,
+        source_scan_ids: list[str],
+        merged_db_path: Path,
+    ) -> dict[str, int]:
+        """Copy keyframe_meta + poi_mark + poi_photo from every source scan
+        into merged_scan_id.
+
+        - rtabmap_node_id is remapped using provenance labels embedded in
+          merged_db_path Node.label (set by `inject_provenance_labels` during
+          stage1 prep). Unmappable rows fall back to NULL rtabmap_node_id and
+          the build-time pose_backfill will pick the nearest stamp.
+        - keyframe_seq is renumbered 1..N across sources in upload order, so
+          (scan_id, seq) stays unique. A per-source seq map drives poi_mark
+          and poi_photo remap.
+        """
+        from indoor_server.application.building.multiscan_pose_mapping import (
+            parse_provenance_label,
         )
+
+        # 1. (source_scan_id, source_node_id) → merged_node_id via labels.
+        node_id_map: dict[tuple[str, int], int] = {}
+        con = sqlite3.connect(str(merged_db_path))
+        try:
+            for merged_id, label in con.execute(
+                "SELECT id, label FROM Node WHERE label IS NOT NULL"
+            ).fetchall():
+                ref = parse_provenance_label(label)
+                if ref is not None:
+                    node_id_map[(ref.scan_id, ref.node_id)] = int(merged_id)
+        finally:
+            con.close()
+
+        # 2. scan_session row (FK target for keyframe_meta). Use the first
+        # source's session fields as device metadata seed.
+        seed = (
+            await self._session.execute(
+                sa.select(t.scan_session).where(
+                    t.scan_session.c.scan_id == source_scan_ids[0]
+                )
+            )
+        ).first()
+        await self._session.execute(
+            sa.insert(t.scan_session).values(
+                scan_id=merged_scan_id,
+                started_at=int(seed.started_at) if seed else 0,
+                ended_at=int(seed.ended_at) if seed and seed.ended_at else None,
+                device_model=str(seed.device_model) if seed else "merged",
+                app_version=str(seed.app_version) if seed else "merged",
+                state="saved",
+                keyframe_count=0,
+                notes=f"multi-scan merge of {len(source_scan_ids)} sources",
+            )
+        )
+
+        # 3. Renumber keyframes across sources.
+        next_seq = 1
+        seq_map: dict[tuple[str, int], int] = {}
+        for src_id in source_scan_ids:
+            rows = (
+                await self._session.execute(
+                    sa.select(t.keyframe_meta)
+                    .where(t.keyframe_meta.c.scan_id == src_id)
+                    .order_by(t.keyframe_meta.c.seq)
+                )
+            ).fetchall()
+            for kf in rows:
+                merged_node_id: int | None = None
+                if kf.rtabmap_node_id is not None:
+                    merged_node_id = node_id_map.get(
+                        (src_id, int(kf.rtabmap_node_id))
+                    )
+                seq_map[(src_id, int(kf.seq))] = next_seq
+                await self._session.execute(
+                    sa.insert(t.keyframe_meta).values(
+                        scan_id=merged_scan_id,
+                        seq=next_seq,
+                        captured_at=kf.captured_at,
+                        image_path=kf.image_path,
+                        pose_matrix=kf.pose_matrix,
+                        tx=kf.tx, ty=kf.ty, tz=kf.tz,
+                        tracking_state=kf.tracking_state,
+                        rtabmap_node_id=merged_node_id,
+                    )
+                )
+                next_seq += 1
+        keyframe_count = next_seq - 1
+        await self._session.execute(
+            sa.update(t.scan_session)
+            .where(t.scan_session.c.scan_id == merged_scan_id)
+            .values(keyframe_count=keyframe_count)
+        )
+
+        # 4. poi_mark + poi_photo. Track old → new id to remap poi_photo FK.
+        poi_count = 0
+        photo_count = 0
+        poi_id_map: dict[int, int] = {}
+        for src_id in source_scan_ids:
+            pms = (
+                await self._session.execute(
+                    sa.select(t.poi_mark)
+                    .where(t.poi_mark.c.scan_id == src_id)
+                    .order_by(t.poi_mark.c.id)
+                )
+            ).fetchall()
+            for pm in pms:
+                merged_seq = seq_map.get((src_id, int(pm.keyframe_seq)))
+                if merged_seq is None:
+                    continue  # orphan POI — keyframe didn't survive
+                new_id = (
+                    await self._session.execute(
+                        sa.insert(t.poi_mark)
+                        .values(
+                            scan_id=merged_scan_id,
+                            keyframe_seq=merged_seq,
+                            created_at=pm.created_at,
+                            pose_matrix=pm.pose_matrix,
+                            tx=pm.tx, ty=pm.ty, tz=pm.tz,
+                            track_id=getattr(pm, "track_id", None),
+                            label=pm.label,
+                            source=pm.source,
+                            canonical_id=pm.canonical_id,
+                        )
+                        .returning(t.poi_mark.c.id)
+                    )
+                ).scalar_one()
+                poi_id_map[int(pm.id)] = int(new_id)
+                poi_count += 1
+
+            photos = (
+                await self._session.execute(
+                    sa.select(t.poi_photo).where(t.poi_photo.c.scan_id == src_id)
+                )
+            ).fetchall()
+            for p in photos:
+                new_poi_id = poi_id_map.get(int(p.poi_mark_id))
+                merged_seq = seq_map.get((src_id, int(p.keyframe_seq)))
+                if new_poi_id is None or merged_seq is None:
+                    continue
+                await self._session.execute(
+                    sa.insert(t.poi_photo).values(
+                        scan_id=merged_scan_id,
+                        poi_mark_id=new_poi_id,
+                        keyframe_seq=merged_seq,
+                        captured_at=p.captured_at,
+                        bbox_x=getattr(p, "bbox_x", None),
+                        bbox_y=getattr(p, "bbox_y", None),
+                        bbox_w=getattr(p, "bbox_w", None),
+                        bbox_h=getattr(p, "bbox_h", None),
+                        class_name=p.class_name,
+                        confidence=p.confidence,
+                        image_path=getattr(p, "image_path", None),
+                        image_blob=p.image_blob,
+                    )
+                )
+                photo_count += 1
+
+        # 5. branch_mark: UNION across sources, with local_id namespaced per
+        # source to avoid collision (each sidecar restarts local_id at 1).
+        # `_LOCAL_ID_NAMESPACE_STEP` keeps the math obvious for inspection.
+        _LOCAL_ID_STEP = 1_000_000
+        branch_count = 0
+        for src_idx, src_id in enumerate(source_scan_ids):
+            bms = (
+                await self._session.execute(
+                    sa.select(t.branch_mark)
+                    .where(t.branch_mark.c.scan_id == src_id)
+                    .order_by(t.branch_mark.c.id)
+                )
+            ).fetchall()
+            for bm in bms:
+                merged_seq = seq_map.get((src_id, int(bm.keyframe_seq)))
+                if merged_seq is None:
+                    continue  # orphan branch — keyframe didn't survive
+                old_local = (
+                    int(bm.local_id) if bm.local_id is not None else None
+                )
+                new_local = (
+                    src_idx * _LOCAL_ID_STEP + old_local
+                    if old_local is not None
+                    else None
+                )
+                await self._session.execute(
+                    sa.insert(t.branch_mark).values(
+                        scan_id=merged_scan_id,
+                        keyframe_seq=merged_seq,
+                        created_at=bm.created_at,
+                        pose_matrix=bm.pose_matrix,
+                        tx=bm.tx, ty=bm.ty, tz=bm.tz,
+                        node_type=bm.node_type,
+                        width_m=getattr(bm, "width_m", None),
+                        connect_hint=getattr(bm, "connect_hint", None),
+                        connect_node_id=getattr(bm, "connect_node_id", None),
+                        mark_session_id=getattr(bm, "mark_session_id", None),
+                        dx_local=getattr(bm, "dx_local", None),
+                        dy_local=getattr(bm, "dy_local", None),
+                        dz_local=getattr(bm, "dz_local", None),
+                        local_id=new_local,
+                    )
+                )
+                branch_count += 1
+
+        # 6. branch_edge: copy with from/to remapped via the same per-source
+        # local_id namespace so cross-scan edges stay well-formed.
+        edge_count = 0
+        for src_idx, src_id in enumerate(source_scan_ids):
+            bes = (
+                await self._session.execute(
+                    sa.select(t.branch_edge)
+                    .where(t.branch_edge.c.scan_id == src_id)
+                    .order_by(t.branch_edge.c.id)
+                )
+            ).fetchall()
+            for be in bes:
+                # branch_edge.from_node_id/to_node_id is TEXT (sidecar
+                # branch_mark.local_id stringified). Apply the same offset.
+                try:
+                    from_local = int(be.from_node_id)
+                    to_local = int(be.to_node_id)
+                except (TypeError, ValueError):
+                    continue
+                new_from = str(src_idx * _LOCAL_ID_STEP + from_local)
+                new_to = str(src_idx * _LOCAL_ID_STEP + to_local)
+                await self._session.execute(
+                    sa.insert(t.branch_edge).values(
+                        scan_id=merged_scan_id,
+                        from_node_id=new_from,
+                        to_node_id=new_to,
+                        kind=be.kind,
+                        length_m=be.length_m,
+                        mark_session_id=getattr(be, "mark_session_id", None),
+                        polygon_closed=getattr(be, "polygon_closed", None),
+                        created_at=be.created_at,
+                    )
+                )
+                edge_count += 1
+
+        # 7. interfloor_mark: copy with keyframe_seq remapped. No local_id, so
+        # no namespace concern.
+        interfloor_count = 0
+        for src_id in source_scan_ids:
+            ims = (
+                await self._session.execute(
+                    sa.select(t.interfloor_mark)
+                    .where(t.interfloor_mark.c.scan_id == src_id)
+                    .order_by(t.interfloor_mark.c.id)
+                )
+            ).fetchall()
+            for im in ims:
+                merged_seq = seq_map.get((src_id, int(im.keyframe_seq)))
+                if merged_seq is None:
+                    continue
+                await self._session.execute(
+                    sa.insert(t.interfloor_mark).values(
+                        scan_id=merged_scan_id,
+                        keyframe_seq=merged_seq,
+                        created_at=im.created_at,
+                        connector_type=im.connector_type,
+                        prefix=im.prefix,
+                        pose_matrix=im.pose_matrix,
+                        tx=im.tx, ty=im.ty, tz=im.tz,
+                        dx_local=getattr(im, "dx_local", None),
+                        dy_local=getattr(im, "dy_local", None),
+                        dz_local=getattr(im, "dz_local", None),
+                    )
+                )
+                interfloor_count += 1
+
+        # 8. poi_canonical: re-point each source's rows at the merged scan_id.
+        for src_id in source_scan_ids:
+            await self._session.execute(
+                sa.text(
+                    "UPDATE poi_canonical SET scan_id = :merged_id "
+                    "WHERE scan_id = :src_id"
+                ),
+                {"merged_id": merged_scan_id, "src_id": src_id},
+            )
+
+        return {
+            "keyframes": keyframe_count,
+            "pois": poi_count,
+            "photos": photo_count,
+            "branches": branch_count,
+            "branch_edges": edge_count,
+            "interfloor": interfloor_count,
+            "mapped_nodes": len(node_id_map),
+        }
+
+    async def _merge_status_for_scan(self, scan_id: str) -> str:
+        latest = await BuildJobRepository(self._session).get_latest(scan_id)
+        if latest is None:
+            return "READY"
+        if latest.state == BuildState.SUCCEEDED:
+            return "COMPLETED"
+        if latest.state == BuildState.FAILED:
+            return "FAILED"
+        if latest.state in (BuildState.PENDING, BuildState.RUNNING):
+            return "PROCESSING"
+        return "READY"
 
     async def process(self, floor_id: UUID) -> ProcessingStatusResponse:
         active = await BuildingFloorService(self._session).get_active_scan_for_floor(floor_id)
@@ -442,168 +837,97 @@ class ScanCompatService:
         assert row is not None
         return row
 
-    async def _select_chunk_for_merge(self, *, floor_id: UUID, chunk_ids: list[UUID]) -> Any:
-        filters = [t.floor_scan.c.floor_id == str(floor_id)]
-        if chunk_ids:
-            chunk_id_strings = [str(value) for value in chunk_ids]
-            filters.append(
-                sa.or_(
-                    t.floor_scan.c.floor_scan_id.in_(chunk_id_strings),
-                    t.floor_scan.c.scan_id.in_(chunk_id_strings),
-                )
-            )
-        row = (
-            await self._session.execute(
-                sa.select(t.floor_scan)
-                .where(*filters)
-                .order_by(t.floor_scan.c.active.desc(), t.floor_scan.c.created_at.asc())
-                .limit(1)
-            )
-        ).first()
-        if row is None:
-            raise V1ServiceError(404, "CHUNK_NOT_FOUND", "scan chunk not found")
-        return row
 
-    async def _copy_anchor_metadata_to_merged(
-        self, *, anchor_scan_id: str, merged_scan_id: str
-    ) -> None:
-        """anchor chunk 의 keyframe_meta / poi_mark / poi_photo / poi_canonical
-        을 merged scan_id 로 복사 → build pipeline 의 POI projection 이 active
-        scan_id (=merged) 로 lookup 시 그대로 보이도록 한다.
+async def _save_upload(upload: UploadFile, dest: Path) -> int:
+    total = 0
+    with open(dest, "wb") as f:
+        while chunk := await upload.read(1 << 18):
+            total += len(chunk)
+            if total > settings.max_upload_bytes:
+                raise V1ServiceError(413, "PAYLOAD_TOO_LARGE", "upload too large")
+            f.write(chunk)
+    return total
 
-        anchor 는 stage3 align 의 reference 좌표계라 transform = identity.
-        """
-        # scan_session 부터 — keyframe_meta 가 scan_session.scan_id 로 FK
-        await self._session.execute(
-            sa.text(
-                "INSERT INTO scan_session "
-                "(scan_id, started_at, ended_at, device_model, app_version, "
-                " state, keyframe_count, notes) "
-                "SELECT :merged_id, started_at, ended_at, device_model, "
-                "       app_version, state, keyframe_count, notes "
-                "FROM scan_session WHERE scan_id = :anchor_id"
-            ),
-            {"merged_id": merged_scan_id, "anchor_id": anchor_scan_id},
-        )
-        # keyframe_meta 복사 (PK = (scan_id, seq), 다른 scan_id 면 충돌 없음)
-        await self._session.execute(
-            sa.text(
-                "INSERT INTO keyframe_meta "
-                "(scan_id, seq, captured_at, image_path, pose_matrix, "
-                " tx, ty, tz, tracking_state, rtabmap_node_id) "
-                "SELECT :merged_id, seq, captured_at, image_path, pose_matrix, "
-                "       tx, ty, tz, tracking_state, rtabmap_node_id "
-                "FROM keyframe_meta WHERE scan_id = :anchor_id"
-            ),
-            {"merged_id": merged_scan_id, "anchor_id": anchor_scan_id},
-        )
-        # poi_mark 복사 (id 는 autoincrement). old_id → new_id 매핑 필요해
-        # 행 단위로 INSERT … RETURNING.
-        old_pois = (
-            await self._session.execute(
-                sa.text(
-                    "SELECT id, keyframe_seq, created_at, pose_matrix, "
-                    "tx, ty, tz, track_id, label, source, canonical_id "
-                    "FROM poi_mark WHERE scan_id = :anchor_id ORDER BY id"
-                ),
-                {"anchor_id": anchor_scan_id},
+
+def _looks_like_zip(filename: str | None) -> bool:
+    return bool(filename and filename.lower().endswith(".zip"))
+
+
+def _chunk_response(
+    row: Any, *, included_in_merged_scan: UUID | None = None,
+) -> ScanChunkResponse:
+    return ScanChunkResponse(
+        chunk_id=UUID(str(row.floor_scan_id)),
+        floor_id=UUID(str(row.floor_id)),
+        scan_id=UUID(str(row.scan_id)),
+        file_name=str(row.file_name) if row.file_name is not None else None,
+        file_size=int(row.file_size) if row.file_size is not None else None,
+        status=str(row.status),
+        active=bool(row.active),
+        upload_order=int(row.upload_order),
+        created_at=row.created_at,
+        included_in_merged_scan=included_in_merged_scan,
+    )
+
+
+async def _kickoff_floor_warmup(*, floor_id: str, scan_id: str) -> None:
+    """Fire-and-forget POST to `/admin/superpoint/warmup` so a freshly
+    activated scan's SuperPoint cache is preloaded before the next /localize.
+
+    Mirrors `BuildService._warmup_superpoint`. Failure here never fails the
+    merge — warmup is opportunistic.
+    """
+    try:
+        reproc = settings.storage_root / "scans" / scan_id / "rtabmap_reprocessed.db"
+        raw = settings.storage_root / "scans" / scan_id / "rtabmap.db"
+        if reproc.exists() and reproc.stat().st_size > 0:
+            db_path = reproc
+        elif raw.exists():
+            db_path = raw
+        else:
+            logger.warning(
+                "merge warmup skipped — no rtabmap db floor=%s scan=%s",
+                floor_id, scan_id,
             )
-        ).fetchall()
-        id_map: dict[int, int] = {}
-        for row in old_pois:
-            new_id = (
-                await self._session.execute(
-                    sa.text(
-                        "INSERT INTO poi_mark "
-                        "(scan_id, keyframe_seq, created_at, pose_matrix, "
-                        " tx, ty, tz, track_id, label, source, canonical_id) "
-                        "VALUES (:scan_id, :seq, :ca, :pm, :tx, :ty, :tz, "
-                        "        :tk, :lbl, :src, :cid) RETURNING id"
-                    ),
-                    {
-                        "scan_id": merged_scan_id,
-                        "seq": row.keyframe_seq,
-                        "ca": row.created_at,
-                        "pm": row.pose_matrix,
-                        "tx": row.tx,
-                        "ty": row.ty,
-                        "tz": row.tz,
-                        "tk": row.track_id,
-                        "lbl": row.label,
-                        "src": row.source,
-                        "cid": row.canonical_id,
-                    },
-                )
-            ).scalar_one()
-            id_map[int(row.id)] = int(new_id)
-        # poi_photo 복사 (poi_mark_id 를 id_map 으로 remap)
-        if id_map:
-            old_photos = (
-                await self._session.execute(
-                    sa.text(
-                        "SELECT poi_mark_id, keyframe_seq, captured_at, "
-                        "bbox_x, bbox_y, bbox_w, bbox_h, class_name, "
-                        "confidence, image_path, image_blob "
-                        "FROM poi_photo WHERE scan_id = :anchor_id"
-                    ),
-                    {"anchor_id": anchor_scan_id},
-                )
-            ).fetchall()
-            for row in old_photos:
-                if int(row.poi_mark_id) not in id_map:
-                    continue
-                await self._session.execute(
-                    sa.text(
-                        "INSERT INTO poi_photo "
-                        "(poi_mark_id, scan_id, keyframe_seq, captured_at, "
-                        " bbox_x, bbox_y, bbox_w, bbox_h, class_name, "
-                        " confidence, image_path, image_blob) "
-                        "VALUES (:pid, :scan_id, :seq, :ca, :bx, :by, :bw, "
-                        "        :bh, :cn, :conf, :ip, :ib)"
-                    ),
-                    {
-                        "pid": id_map[int(row.poi_mark_id)],
-                        "scan_id": merged_scan_id,
-                        "seq": row.keyframe_seq,
-                        "ca": row.captured_at,
-                        "bx": row.bbox_x,
-                        "by": row.bbox_y,
-                        "bw": row.bbox_w,
-                        "bh": row.bbox_h,
-                        "cn": row.class_name,
-                        "conf": row.confidence,
-                        "ip": row.image_path,
-                        "ib": row.image_blob,
-                    },
-                )
-        # poi_canonical: scan_id 를 merged 로 update
-        await self._session.execute(
-            sa.text(
-                "UPDATE poi_canonical SET scan_id = :merged_id "
-                "WHERE scan_id = :anchor_id"
-            ),
-            {"merged_id": merged_scan_id, "anchor_id": anchor_scan_id},
-        )
+            return
+        import httpx as _httpx
+        url = "http://server:8000/admin/superpoint/warmup"
+        payload = {"map_id": floor_id, "db_path": str(db_path)}
+        async with _httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload)
         logger.info(
-            "stage4 metadata copy done anchor=%s → merged=%s "
-            "keyframes_copied (via INSERT SELECT) poi_marks=%d photos=%d",
-            anchor_scan_id,
-            merged_scan_id,
-            len(old_pois),
-            len(id_map),
+            "merge warmup queued floor=%s status=%d",
+            floor_id, resp.status_code,
+        )
+    except Exception as exc:
+        logger.warning(
+            "merge warmup trigger failed floor=%s scan=%s err=%s",
+            floor_id, scan_id, exc,
         )
 
-    async def _merge_status_for_scan(self, scan_id: str) -> str:
-        latest = await BuildJobRepository(self._session).get_latest(scan_id)
-        if latest is None:
-            return "MERGED"
-        if latest.state == BuildState.SUCCEEDED:
-            return "COMPLETED"
-        if latest.state == BuildState.FAILED:
-            return "FAILED"
-        if latest.state in (BuildState.PENDING, BuildState.RUNNING):
-            return "PROCESSING"
-        return "MERGED"
+
+def _processing_response(
+    floor_id: UUID,
+    scan_id: str,
+    job: Any,
+) -> ProcessingStatusResponse:
+    state = str(job.state.value if hasattr(job.state, "value") else job.state)
+    mapped = {
+        "pending": "PROCESSING",
+        "running": "PROCESSING",
+        "succeeded": "COMPLETED",
+        "failed": "FAILED",
+        "cancelled": "FAILED",
+    }.get(state, "NOT_STARTED")
+    failure = getattr(job, "failure_detail", None)
+    return ProcessingStatusResponse(
+        floor_id=floor_id,
+        scan_id=UUID(scan_id),
+        build_job_id=job.build_job_id,
+        status=mapped,
+        progress=getattr(job, "progress", None),
+        error=str(failure) if failure is not None else None,
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -615,7 +939,7 @@ def _sha256_file(path: Path) -> str:
 
 
 class _ReprocessFailed(Exception):
-    """single rtabmap-reprocess invocation failed."""
+    """Single rtabmap-reprocess invocation failed."""
 
 
 class _AlignFailed(Exception):
@@ -628,10 +952,15 @@ def _align_and_patch_merged(
     a_source_db: Path,
     b_source_db: Path,
 ) -> None:
-    """stage2 unaligned merged.db 를 source A/B 의 ARKit pose 와 cross-session
-    loop closure 로 RANSAC 정렬한 결과로 patch 해 out_db 에 저장.
+    """Yaw-only RANSAC SE(3) alignment for the 2-source merge case.
 
-    sprint81/align_and_rebuild_merged 의 함수들을 재사용한다 (이미 검증됨).
+    rtabmap-reprocess `-a` leaves the two ARKit-world origins union'd when the
+    cross-session loop closures imply translations the graph optimizer rejects
+    as outliers. We recover the rigid transform from A's frame to B's frame and
+    apply yaw-only constraint (indoor single-floor assumption) so the floor
+    plane stays flat.
+
+    Reuses sprint81/align_and_rebuild_merged helpers (validated).
     """
     from scripts.sprint81.align_and_rebuild_merged import (
         estimate_T_AB_ransac,
@@ -659,9 +988,6 @@ def _align_and_patch_merged(
     except ValueError as e:
         raise _AlignFailed(f"RANSAC failed: {e}") from e
 
-    # indoor 1층 가정: yaw-only constraint. z translation 과 roll/pitch 가
-    # cross-session loop closure noise 로 인해 mean 이 흔들리면 chunk B 가
-    # floor plane 위로 들려서 floor segmentation 이 못 잡는다.
     import numpy as np
 
     yaw = float(np.arctan2(T_AB[1, 0], T_AB[0, 0]))
@@ -680,19 +1006,12 @@ def _align_and_patch_merged(
     T_AB_planar[2, 3] = 0.0
     logger.info(
         "stage3 yaw-only constraint applied: yaw=%.2f deg, t=(%.2f, %.2f, 0.0)",
-        np.degrees(yaw),
-        T_AB_planar[0, 3],
-        T_AB_planar[1, 3],
+        np.degrees(yaw), T_AB_planar[0, 3], T_AB_planar[1, 3],
     )
-    T_AB = T_AB_planar
-
-    patch_merged_db(stage2_db, out_db, a_poses, b_poses, T_AB, a_count)
+    patch_merged_db(stage2_db, out_db, a_poses, b_poses, T_AB_planar, a_count)
     logger.info(
         "stage3 align: cross_pairs=%d inliers=%d rmse=%.3f T_AB.t=%s",
-        len(cross_pairs),
-        inliers,
-        rmse,
-        T_AB[:3, 3].round(3).tolist(),
+        len(cross_pairs), inliers, rmse, T_AB_planar[:3, 3].round(3).tolist(),
     )
 
 
@@ -703,24 +1022,22 @@ async def _run_rtabmap_reprocess_single(
     output_db: Path,
     timeout_s: float,
 ) -> None:
-    """단독 reprocess: input.db 의 모든 노드에 SIFT feature + 3D back-projection 강제.
+    """Single-source reprocess to populate SIFT Word/Feature.
 
-    `-default` 로 input db 의 params 를 무시하고 default 를 사용해야 클라이언트가
-    `Mem/IncrementalMemory=false` 등으로 박아 보낸 db 도 정상 reprocess 된다.
-    `--Vis/FeatureType 1` + `--Kp/DetectorStrategy 1` 로 SIFT 강제.
+    `-default` discards the input db's params so client-side overrides
+    (e.g. Mem/IncrementalMemory=false) don't leak through. We force SIFT via
+    `Vis/FeatureType=1` + `Kp/DetectorStrategy=1`.
     """
     output_db.parent.mkdir(parents=True, exist_ok=True)
     if output_db.exists():
         output_db.unlink()
     cmd = [
-        binary_path,
-        "-default",
+        binary_path, "-default",
         "--Mem/IncrementalMemory", "true",
         "--Vis/FeatureType", "1",
         "--Kp/DetectorStrategy", "1",
         "--uwarn",
-        str(input_db),
-        str(output_db),
+        str(input_db), str(output_db),
     ]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -728,7 +1045,7 @@ async def _run_rtabmap_reprocess_single(
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        _, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except TimeoutError as e:
         proc.kill()
         await proc.wait()
@@ -738,56 +1055,3 @@ async def _run_rtabmap_reprocess_single(
         raise _ReprocessFailed(
             f"exit {proc.returncode}; stderr tail: {stderr_text[-1200:]}"
         )
-
-
-async def _save_upload(upload: UploadFile, dest: Path) -> int:
-    total = 0
-    with open(dest, "wb") as f:
-        while chunk := await upload.read(1 << 18):
-            total += len(chunk)
-            if total > settings.max_upload_bytes:
-                raise V1ServiceError(413, "PAYLOAD_TOO_LARGE", "upload too large")
-            f.write(chunk)
-    return total
-
-
-def _looks_like_zip(filename: str | None) -> bool:
-    return bool(filename and filename.lower().endswith(".zip"))
-
-
-def _chunk_response(row: Any) -> ScanChunkResponse:
-    return ScanChunkResponse(
-        chunk_id=UUID(str(row.floor_scan_id)),
-        floor_id=UUID(str(row.floor_id)),
-        scan_id=UUID(str(row.scan_id)),
-        file_name=str(row.file_name) if row.file_name is not None else None,
-        file_size=int(row.file_size) if row.file_size is not None else None,
-        status=str(row.status),
-        active=bool(row.active),
-        upload_order=int(row.upload_order),
-        created_at=row.created_at,
-    )
-
-
-def _processing_response(
-    floor_id: UUID,
-    scan_id: str,
-    job: Any,
-) -> ProcessingStatusResponse:
-    state = str(job.state.value if hasattr(job.state, "value") else job.state)
-    mapped = {
-        "pending": "PROCESSING",
-        "running": "PROCESSING",
-        "succeeded": "COMPLETED",
-        "failed": "FAILED",
-        "cancelled": "FAILED",
-    }.get(state, "NOT_STARTED")
-    failure = getattr(job, "failure_detail", None)
-    return ProcessingStatusResponse(
-        floor_id=floor_id,
-        scan_id=UUID(scan_id),
-        build_job_id=job.build_job_id,
-        status=mapped,
-        progress=getattr(job, "progress", None),
-        error=str(failure) if failure is not None else None,
-    )

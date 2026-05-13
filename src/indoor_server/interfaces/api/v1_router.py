@@ -34,6 +34,9 @@ from indoor_server.application.api_v1.localization_adapter import LocalizationAd
 from indoor_server.application.api_v1.pathfinding_adapter import PathfindingAdapter
 from indoor_server.application.api_v1.poi_catalog_service import POICatalogService
 from indoor_server.application.api_v1.scan_compat_service import ScanCompatService
+from indoor_server.application.scan_streaming.streaming_service import (
+    ScanStreamingService,
+)
 from indoor_server.infrastructure.db.engine import get_session
 from indoor_server.interfaces.api.v1_schemas import (
     BuildingCreateRequest,
@@ -61,6 +64,11 @@ from indoor_server.interfaces.api.v1_schemas import (
     POIResponse,
     ProcessingStatusResponse,
     ScanChunkResponse,
+    ScanFinalizeResponse,
+    ScanFramesRequest,
+    ScanFramesResponse,
+    ScanStartRequest,
+    ScanStartResponse,
     SlamMetadataResponse,
     SlamStatusResponse,
     V1ErrorResponse,
@@ -649,12 +657,32 @@ async def delete_scan_chunk(
     response_model=MergedScanResponse,
     responses=_V1_ERRORS,
     tags=[V1_TAG_SCAN_PROCESSING],
+    summary="다중 세션 병합 — N개 READY/UPLOADED 스캔을 하나의 active 스캔으로 통합",
 )
 async def merge_scans(
     floor_id: Annotated[UUID, Path(alias="floorId")],
     request: MergeScansRequest,
     session: AsyncSession = Depends(get_session),
 ) -> MergedScanResponse:
+    """Merge multiple finalized scans on a floor into a single active scan.
+
+    ## 언제 사용하나
+    - 한 플로어를 여러 세션에 걸쳐 스캔했을 때 (배터리/면적 한계, 부분 리스캔 등)
+    - 소스: streaming `/scans/finalize` 산출 (status=READY) 또는 zip 청크
+      `/scans/chunks` 산출 (status=UPLOADED). 두 종류 섞여도 됨
+
+    ## 어떻게 사용하나
+    1. (선택) `chunkIds` 로 병합 대상 명시. 비우면 floor 의 READY/UPLOADED 전부
+    2. 단일 source 면 active flag 만 flip — reprocess 없음
+    3. 다중 source 면 rtabmap-reprocess multi-scan + RANSAC SE(3) align (2개)
+
+    ## 결과
+    - 새 `merged_scan_id` 생성, `status=READY, active=true` 로 floor_scan 등록
+    - 각 source scan 의 keyframe_meta / poi_mark / poi_photo 가 merged_scan_id 로
+      **union 복사**됨. rtabmap_node_id 는 provenance label 로 remap, keyframe_seq
+      는 1..N 로 renumbering
+    - 이후 `/floors/{floorId}/build` 호출 시 merged scan 이 빌드 대상
+    """
     try:
         return await ScanCompatService(session).merge(floor_id, request.chunk_ids)
     except V1ServiceError as e:
@@ -666,11 +694,13 @@ async def merge_scans(
     response_model=MergedScanResponse,
     responses=_V1_ERRORS,
     tags=[V1_TAG_SCAN_PROCESSING],
+    summary="병합/활성 스캔 상태 조회",
 )
 async def get_merge_status(
     floor_id: Annotated[UUID, Path(alias="floorId")],
     session: AsyncSession = Depends(get_session),
 ) -> MergedScanResponse:
+    """Return the active scan on the floor + its build status."""
     try:
         return await ScanCompatService(session).merge_status(floor_id)
     except V1ServiceError as e:
@@ -678,15 +708,193 @@ async def get_merge_status(
 
 
 @v1_router.post(
-    "/floors/{floorId}/process",
+    "/floors/{floorId}/scans/start",
+    response_model=ScanStartResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=_V1_ERRORS,
+    tags=[V1_TAG_SCAN_PROCESSING],
+    summary="스트리밍 스캔 시작 — 빈 rtabmap.db 생성 + 수신 준비",
+)
+async def start_scan_stream(
+    floor_id: Annotated[UUID, Path(alias="floorId")],
+    request: ScanStartRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ScanStartResponse:
+    """Open a new streaming scan on a floor.
+
+    ## 언제 사용하나
+    클라가 새 스캔을 시작할 때 처음으로 호출. 이후 frames endpoint 를 K개씩
+    반복 호출해 데이터를 적재하고, 마지막에 finalize 로 종료한다.
+
+    ## 어떻게 사용하나
+    1. floor_id 와 (선택) client-generated scan UUID 를 보낸다.
+    2. 응답의 `scanId` 를 보관 — 이후 frames/finalize 호출 시 사용.
+    3. 같은 scan_id 로 OPEN 상태에서 재호출하면 idempotent resume.
+
+    ## 수정 / 재스캔 정책
+    finalize 된 (READY) scan 은 **immutable**. 사용자가 마크를 수정하거나
+    재스캔하려면 **새 scan_id 로 다시 streaming** 시작 (이 endpoint 호출).
+    옛 source scan 은 floor 의 source 리스트에 그대로 남고, 새 source 와 함께
+    `/floors/{floorId}/scans/merge` 로 자유롭게 조합 가능. merge 결과는
+    사용자에게 보이지 않는 internal scan (status=MERGED, list 에서 숨김) 이며
+    graph 표시에만 사용된다.
+
+    ## 응답
+    `state=OPEN`. 서버에 빈 rtabmap.db 가 생성되고 floor_scan 행이 OPEN 으로
+    추가된다.
+    """
+    try:
+        result = await ScanStreamingService(session).start_scan(
+            floor_id=floor_id,
+            scan_id=request.scan_id,
+            device_info=request.device_info,
+        )
+    except V1ServiceError as e:
+        _raise_v1(e)
+    return ScanStartResponse(
+        scanId=UUID(result.scan_id),
+        floorId=UUID(result.floor_id),
+        storagePath=result.storage_path,
+        state="OPEN",
+    )
+
+
+@v1_router.post(
+    "/scans/{scanId}/frames",
+    response_model=ScanFramesResponse,
+    responses=_V1_ERRORS,
+    tags=[V1_TAG_SCAN_PROCESSING],
+    summary="스트리밍 스캔 — K개 프레임 + 링크 배치 적재",
+)
+async def append_scan_frames(
+    scan_id: Annotated[str, Path(alias="scanId")],
+    request: ScanFramesRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ScanFramesResponse:
+    """Append a batch of Node/Data/Link rows to the open rtabmap.db.
+
+    ## Blob 인코딩
+    - 모든 binary blob 은 **표준 base64** 로 인코딩.
+    - `pose`, `transform` = 48 bytes (3×4 float32 row-major, RTAB-Map world).
+    - `calibration` = 164 bytes (intrinsics + local_transform).
+    - `informationMatrix` = 288 bytes (6×6 float64). 생략 시 identity.
+    - `image` = JPEG bytes. `depth` = RVL bytes (없어도 됨).
+
+    ## Idempotency
+    이미 적재된 `nodeId` 는 skip 된다 (응답의 `framesSkipped` 로 확인).
+    네트워크 재시도 시 같은 batch 를 다시 보내도 안전.
+
+    ## 순서 / ID
+    클라가 자기 rtabmap.db 에 저장한 그대로 (Node.id incremental) 보내면 충돌
+    없음. Link 는 동일 batch 또는 이전 batch 에 이미 적재된 Node 만 참조해야
+    하며 그렇지 않은 Link 는 skip + `linksSkipped` 카운트로 보고된다.
+    """
+    try:
+        from indoor_server.application.scan_streaming.rtabmap_db_writer import (
+            FrameRecord,
+            LinkRecord,
+        )
+
+        frames = [_frame_payload_to_record(f) for f in request.frames]
+        links = [_link_payload_to_record(lk) for lk in request.links]
+        result = await ScanStreamingService(session).append_frames(
+            scan_id=scan_id, frames=frames, links=links,
+        )
+    except V1ServiceError as e:
+        _raise_v1(e)
+    return ScanFramesResponse(
+        scanId=UUID(result.scan_id),
+        framesApplied=result.frames_applied,
+        framesSkipped=result.frames_skipped,
+        linksApplied=result.links_applied,
+        linksSkipped=result.links_skipped,
+        lastNodeId=result.last_node_id,
+        nodeCount=result.node_count,
+    )
+
+
+@v1_router.post(
+    "/scans/{scanId}/finalize",
+    response_model=ScanFinalizeResponse,
+    responses=_V1_ERRORS,
+    tags=[V1_TAG_SCAN_PROCESSING],
+    summary="스트리밍 스캔 종료 — manifest.json + scan_metadata.db 업로드",
+)
+async def finalize_scan_stream(
+    scan_id: Annotated[str, Path(alias="scanId")],
+    manifest: UploadFile = File(
+        ...,
+        description="manifest.json (JSON). 필수 키: metadata_version (int), "
+        "mode ∈ {live_rtabmap, raw_arkit_recording, raw_video_recording}. "
+        "scan_id 가 있으면 path scan_id 와 일치해야 함. 클라가 작성한 "
+        "manifest 본문이 그대로 디스크에 저장됨 (서버 fabricate 안 함).",
+    ),
+    metadata: UploadFile = File(
+        ...,
+        description="scan_metadata.db (sqlite). keyframe_meta / poi_mark / "
+        "branch_mark / interfloor_mark / poi_photo 등 sidecar 일체.",
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> ScanFinalizeResponse:
+    """Upload manifest.json + scan_metadata.db, ingest into Postgres, mark READY.
+
+    ## 흐름
+    1. **manifest.json 검증** (mode 화이트리스트, scan_id 일치) 후 디스크 저장.
+       서버가 manifest 를 만들지 않음 — 클라가 반드시 보내야 함.
+    2. scan_metadata.db 를 `scans/{scan_id}/scan_metadata.db` 로 저장.
+    3. parser 가 user_version + schema 검증.
+    4. keyframe_meta / poi_mark / poi_photo / branch_mark / interfloor_mark /
+       branch_edge 를 Postgres 에 적재 (replace 모드).
+    5. rtabmap.db sha256 재계산 → scan_ingest.payload_sha256 UPDATE.
+    6. floor_scan.status='READY'.
+
+    ## 빌드 트리거
+    finalize 는 build 를 자동 트리거하지 **않는다**. 이후 클라가 `POST
+    /floors/{floorId}/build` 를 명시적으로 호출해야 한다. manifest.mode 가
+    build pipeline 의 reprocess 분기 조건이라 정확히 보내는 게 중요함.
+    """
+    try:
+        result = await ScanStreamingService(session).finalize_scan(
+            scan_id=scan_id,
+            sidecar_upload=metadata,
+            manifest_upload=manifest,
+        )
+    except V1ServiceError as e:
+        _raise_v1(e)
+    return ScanFinalizeResponse(
+        scanId=UUID(result.scan_id),
+        floorId=UUID(result.floor_id),
+        state="READY",
+        nodeCount=result.node_count,
+        keyframeCount=result.keyframe_count,
+        poiMarkCount=result.poi_mark_count,
+        payloadSha256=result.payload_sha256,
+    )
+
+
+@v1_router.post(
+    "/floors/{floorId}/build",
     response_model=ProcessingStatusResponse,
     responses=_V1_ERRORS,
     tags=[V1_TAG_SCAN_PROCESSING],
+    summary="플로어 빌드 트리거 — 활성 스캔에 대해 reprocess + map build 시작",
 )
-async def process_floor(
+async def build_floor(
     floor_id: Annotated[UUID, Path(alias="floorId")],
     session: AsyncSession = Depends(get_session),
 ) -> ProcessingStatusResponse:
+    """Enqueue a build_job for the floor's active READY scan.
+
+    ## 언제 사용하나
+    finalize 가 끝난 직후 클라가 호출. 워커가 picks 해서:
+    1. rtabmap-reprocess (graph optimization, loop closure, SuperPoint feature)
+    2. pose_backfill — keyframe_meta / poi_mark / branch_mark / interfloor_mark
+       의 world pose 를 optimized pose × dx/dy/dz_local 로 갱신
+    3. floor polygon + nav graph 빌드 + map_node/map_edge 적재
+
+    ## 폴링
+    `GET /floors/{floorId}/process/status` 로 진행률 / 결과 확인.
+    """
     try:
         return await ScanCompatService(session).process(floor_id)
     except V1ServiceError as e:
@@ -729,31 +937,29 @@ async def post_pathfinding(
     경로 자체가 바뀌지 않으면 재호출 불필요.
 
     ## 어떻게 사용하나
-    1. `/buildings/{id}/localize` 로 현재 위치 측위 (`pose.tx/ty/tz`, `mapId`).
+    1. `/buildings/{id}/localize` 로 현재 위치 측위 (`pose.tx/ty/tz`).
     2. 이 endpoint 호출:
-       - `startScanId` = localize 응답의 `mapId` (시작 floor 자동 결정)
        - `startX/Y/Z` = localize 응답의 `pose.tx/ty/tz`
        - `destinationName` = 사용자가 선택한 POI 이름 (예: '301호')
        - `verticalPreference` = `ELEVATOR` 또는 `STAIRS` (기본 ELEVATOR)
+       - 시작 floor 는 좌표 z 로 서버가 자동 결정. override 필요할 때만 `startFloorLevel`.
     3. 응답의 `steps[]` 좌표를 polyline 으로 그림. 좌표계는 지도와 동일 (world meter).
     4. `floorTransitions[]` 가 있으면 층 전환 안내 표시 (예: "엘리베이터 EV-A 타고 3층").
 
     ## 왜 사용하나
     - 멀티층 자동 라우팅: 같은 connector key 끼리 자동 cross-floor edge 생성.
     - `verticalPreference` 로 사용자 선호 반영 (엘베만 / 계단만).
-    - `startScanId` 만 보내면 floor 자동 — 클라가 floor_level 직접 관리할 필요 없음.
+    - 클라는 building_id + 좌표만 보내면 됨 — scan_id / floor_level 관리 불필요.
 
     ## 응답 해석
     - `steps[]`: 각 노드의 (x, y, z, floorLevel) 순서대로. polyline 으로 연결.
     - `floorTransitions[]`: 층 변경 지점. `connectorType`/`connectorKey` 표시.
     - `routeMetadata.verticalPreference`: 적용된 preference echo.
-    - `routeMetadata.startScanId` / `startFloorLevel`: 실제 사용된 시작 정보.
+    - `routeMetadata.startScanId` / `startFloorLevel`: 서버가 자동 선택한 시작 정보 (디버깅용).
 
     ## 에러
     - `404 ACTIVE_SCAN_NOT_FOUND`: 빌딩에 active scan 이 하나도 없음.
-    - `404 START_SCAN_NOT_FOUND`: `startScanId` 가 이 빌딩의 active scan 이 아님.
-    - `404 START_FLOOR_NOT_FOUND`: `startFloorLevel` 에 active scan 없음.
-    - `422 START_NOT_SPECIFIED`: `startScanId` / `startFloorLevel` 둘 다 없음.
+    - `404 START_FLOOR_NOT_FOUND`: `startFloorLevel` override 가 active scan 없는 층.
     - `422 SNAP_DISTANCE_EXCEEDED`: 시작 좌표가 그래프에서 너무 멀음 (5m 초과).
     - `422 PATH_NOT_FOUND`: 경로 없음. `verticalPreference` 가 `STAIRS` 인데
       빌딩에 계단이 없으면 발생 — 클라는 `ELEVATOR` 로 fallback 권장.
@@ -1069,4 +1275,71 @@ def _raise_v1(error: V1ServiceError) -> NoReturn:
     raise HTTPException(
         status_code=error.status_code,
         detail={"code": error.code, "message": error.message, "detail": error.detail},
+    )
+
+
+def _b64decode(value: str | None) -> bytes | None:
+    if value is None:
+        return None
+    import base64
+
+    try:
+        return base64.b64decode(value, validate=True)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "BASE64_INVALID",
+                "message": "invalid base64 payload",
+                "detail": {"error": str(e)},
+            },
+        ) from e
+
+
+def _frame_payload_to_record(payload: Any) -> Any:
+    """Pydantic FramePayload → rtabmap_db_writer.FrameRecord.
+
+    Defined here (not in the schema module) so the writer module stays
+    free of Pydantic / HTTP concerns.
+    """
+    from indoor_server.application.scan_streaming.rtabmap_db_writer import (
+        FrameRecord,
+    )
+
+    pose = _b64decode(payload.pose_b64) or b""
+    image = _b64decode(payload.image_b64) or b""
+    calibration = _b64decode(payload.calibration_b64) or b""
+    return FrameRecord(
+        node_id=payload.node_id,
+        map_id=payload.map_id,
+        weight=payload.weight,
+        stamp=float(payload.stamp),
+        pose=pose,
+        image=image,
+        calibration=calibration,
+        depth=_b64decode(payload.depth_b64),
+        depth_confidence=_b64decode(payload.depth_confidence_b64),
+        ground_truth_pose=_b64decode(payload.ground_truth_pose_b64),
+        velocity=_b64decode(payload.velocity_b64),
+        label=payload.label,
+        gps=_b64decode(payload.gps_b64),
+        env_sensors=_b64decode(payload.env_sensors_b64),
+        user_data=_b64decode(payload.user_data_b64),
+        scan=_b64decode(payload.scan_b64),
+        scan_info=_b64decode(payload.scan_info_b64),
+    )
+
+
+def _link_payload_to_record(payload: Any) -> Any:
+    from indoor_server.application.scan_streaming.rtabmap_db_writer import (
+        LinkRecord,
+    )
+
+    return LinkRecord(
+        from_id=payload.from_id,
+        to_id=payload.to_id,
+        type=payload.type,
+        transform=_b64decode(payload.transform_b64) or b"",
+        information_matrix=_b64decode(payload.information_matrix_b64),
+        user_data=_b64decode(payload.user_data_b64),
     )
